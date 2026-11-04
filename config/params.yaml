@@ -6,7 +6,7 @@ thermal_change_detection:
     camera_frame: ""            # empty -> image header frame_id
     frame_is_optical: true      # false if camera_frame is x-forward/z-up
     process_period: 1.0         # [s] process at most one image per period
-    tf_timeout: 0.2             # [s]
+    tf_timeout: 0.5             # [s] max wait (image-stamp time) for an image's TF
 
     store:
       r_insert: 0.5             # [m]   store a keyframe if none within r_insert AND theta_insert

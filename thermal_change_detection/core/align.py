@@ -17,7 +17,7 @@ class AlignResult:
     W: np.ndarray            # 3x3, current px -> reference px (refined)
     W0: np.ndarray           # 3x3, same but from the pose prior only
     correlation: float
-    correction_px: float     # max corner displacement W vs W0
+    correction_px: float     # displacement of the image centre, W vs W0
     overlap: float           # fraction of valid current pixels covered by the reference
     reason: str = ''
 
@@ -73,8 +73,17 @@ def _corner_shift(W, W0, w, h):
     return float(np.max(np.linalg.norm(p - p0, axis=0)))
 
 
-def align(cur, cur_valid, ref, ref_valid, H_cur_ref, cfg) -> AlignResult:
-    """Align ``ref`` onto ``cur``. H_cur_ref is the pose prior (ref px -> cur px)."""
+def _centre_shift(W, W0, w, h):
+    c = np.array([(w - 1) / 2.0, (h - 1) / 2.0, 1.0])
+    p, p0 = W @ c, W0 @ c
+    return float(np.linalg.norm(p[:2] / p[2] - p0[:2] / p0[2]))
+
+
+def align(cur, cur_valid, ref, ref_valid, H_cur_ref, cfg, trace=None) -> AlignResult:
+    """Align ``ref`` onto ``cur``. H_cur_ref is the pose prior (ref px -> cur px).
+
+    ``trace``: optional list; one dict per pyramid level is appended
+    (level, scale, W after the level [full-res px], error message or '')."""
     h, w = cur.shape[:2]
     W0 = np.linalg.inv(H_cur_ref)
     W0 /= W0[2, 2]
@@ -104,15 +113,18 @@ def align(cur, cur_valid, ref, ref_valid, H_cur_ref, cfg) -> AlignResult:
                                               criteria, m_l, g)
                 W = np.linalg.inv(S) @ W_l.astype(np.float64) @ S
                 W /= W[2, 2]
-            except cv2.error:
-                pass  # keep the estimate from the previous level
+                err = ''
+            except cv2.error as e:
+                err = str(e).strip().splitlines()[-1]  # keep the previous level's estimate
+            if trace is not None:
+                trace.append({'level': level, 'scale': s, 'W': W.copy(), 'error': err})
 
     # Evaluate the final warp at full resolution.
     ref_w = warp_to_current(ref_p, W, (w, h))
     m_w = (warp_to_current(ref_m, W, (w, h), cv2.INTER_NEAREST) > 0) & (cur_valid > 0)
     overlap = float(m_w.sum()) / max(1, int((cur_valid > 0).sum()))
     rho = masked_correlation(cur_p, ref_w, m_w)
-    shift = _corner_shift(W, W0, w, h)
+    shift = _centre_shift(W, W0, w, h)
 
     reason = ''
     if overlap < cfg.min_overlap:

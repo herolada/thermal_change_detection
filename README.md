@@ -52,4 +52,17 @@ ros2 run thermal_change_detection offline_eval <bag> -o /tmp/tcd_out \
     --params src/thermal_change_detection/config/params.yaml
 ```
 
+Step-by-step HTML debug report on a bag (same pipeline and subsampling,
+with every intermediate image): keyframe/frame pairs with the pose change,
+the pose-prior homography, ECC per pyramid level, the quality gate (why a
+frame is `REJECTED`), and each change-detection step down to the blobs.
+Open `index.html` in a browser; `--detail 50:80` limits the per-frame pages.
+
+```bash
+ros2 run thermal_change_detection debug_report ~/bags/bag_20261104_130658 -o /tmp/tcd_report \
+    --params src/thermal_change_detection/config/params.yaml \
+    --image /camera_front_thermo/image_raw/compressed \
+    --camera-info /camera_front_thermo/camera_info --map-frame FP_ENU0
+```
+
 Tests: `python3 -m pytest src/thermal_change_detection/test`

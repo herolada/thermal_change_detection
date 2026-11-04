@@ -34,7 +34,7 @@ class AlignConfig:
     use_gradient: bool = False          # align gradient magnitude instead of intensities
     # Quality gate: the frame is rejected (no change map) if any check fails.
     min_correlation: float = 0.6        # final ECC correlation coefficient
-    max_correction_px: float = 80.0     # max shift of image corners vs. the pose prior
+    max_correction_px: float = 80.0     # max shift of the image centre vs. the pose prior
     min_overlap: float = 0.3            # overlapping fraction of the current image
 
 

@@ -8,7 +8,6 @@ Publishes:   ~/overlay (bgr8), ~/diff (32FC1, signed, NaN outside overlap),
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
-from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -36,7 +35,9 @@ class ThermalChangeDetectionNode(Node):
         # instead of the optical one (z fwd, y down).
         self.frame_is_optical = self.declare_parameter('frame_is_optical', True).value
         self.process_period = self.declare_parameter('process_period', 1.0).value
-        self.tf_timeout = self.declare_parameter('tf_timeout', 0.2).value
+        # Max time [s, image-stamp time] an image may wait for its TF before
+        # it is dropped. Waiting is non-blocking (retried on newer images).
+        self.tf_timeout = self.declare_parameter('tf_timeout', 0.5).value
 
         cfg = PipelineConfig()
         defaults = flatten(cfg)
@@ -46,10 +47,13 @@ class ThermalChangeDetectionNode(Node):
         self.get_logger().info(f'keyframes stored in {self.pipeline.store.run_dir}')
 
         self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self, spin_thread=True)
+        # No spin_thread: it moves this whole node onto the listener's executor
+        # (a node has one executor). Callbacks never block, so one thread is fine.
+        self.tf_listener = TransformListener(self.tf_buffer, self)
         self.bridge = CvBridge()
         self.camera_info = None
         self.last_stamp = None
+        self.pending = None   # image due for processing, waiting for its TF
 
         sensor_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                                 reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -68,19 +72,29 @@ class ThermalChangeDetectionNode(Node):
         if info is None:
             self.get_logger().warning('waiting for camera_info', throttle_duration_sec=5.0)
             return
+        t = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        if self.pending is None and not (
+                self.last_stamp is not None and 0.0 <= t - self.last_stamp < self.process_period):
+            self.pending = msg
+        if self.pending is not None:
+            self.try_process_pending(t, info)
+
+    def try_process_pending(self, newest_t, info):
+        """Process the pending image if its TF is available (never blocks)."""
+        msg = self.pending
         stamp = Time.from_msg(msg.header.stamp)
         t = stamp.nanoseconds * 1e-9
-        if self.last_stamp is not None and 0.0 <= t - self.last_stamp < self.process_period:
-            return
-
         frame = self.camera_frame or msg.header.frame_id
         try:
-            tf = self.tf_buffer.lookup_transform(self.map_frame, frame, stamp,
-                                                 timeout=Duration(seconds=self.tf_timeout))
+            tf = self.tf_buffer.lookup_transform(self.map_frame, frame, stamp)
         except TransformException as e:
-            self.get_logger().warning(f'TF {self.map_frame} <- {frame}: {e}',
-                                      throttle_duration_sec=5.0)
+            if not 0.0 <= newest_t - t <= self.tf_timeout:
+                self.pending = None
+                self.get_logger().warning(
+                    f'TF {self.map_frame} <- {frame} not available within '
+                    f'{self.tf_timeout:.2f} s, dropping image: {e}', throttle_duration_sec=5.0)
             return
+        self.pending = None
         T = tf_to_matrix(tf)
         if not self.frame_is_optical:
             T = T @ T_BODY_OPTICAL

@@ -30,6 +30,7 @@ class FrameResult:
     change: Optional[ChangeResult] = None
     reference_view: Optional[np.ndarray] = None  # mono8, aligned + gain-corrected reference
     blobs: List[Blob] = field(default_factory=list)  # change + hotspot blobs
+    debug: Optional[dict] = None                # intermediates, only with process(debug=True)
 
     @property
     def detections(self):
@@ -59,9 +60,11 @@ class ChangeDetectionPipeline:
             self._undist = Undistorter(K, D, size, model)
         return self._undist
 
-    def process(self, image, stamp, T_map_cam, K, D=None, distortion_model='plumb_bob'):
+    def process(self, image, stamp, T_map_cam, K, D=None, distortion_model='plumb_bob',
+                debug=False):
         """image: mono8/mono16 (or BGR, converted to gray); stamp in seconds;
-        T_map_cam: 4x4 optical-frame camera pose; K: 3x3; D: distortion coeffs."""
+        T_map_cam: 4x4 optical-frame camera pose; K: 3x3; D: distortion coeffs.
+        debug=True keeps the intermediate images/warps in ``FrameResult.debug``."""
         cfg = self.cfg
         K = np.asarray(K, dtype=np.float64).reshape(3, 3)
         img = to_mono(np.asarray(image))
@@ -76,6 +79,8 @@ class ChangeDetectionPipeline:
             self.hotspot_tracker.update(hot_blobs, hot_labels, stamp, T_map_cam, K)
 
         res = FrameResult(stamp, '', None)
+        if debug:
+            res.debug = {'cur': cur, 'valid': valid, 'K': K, 'T_map_cam': np.array(T_map_cam)}
         match = self.store.query(T_map_cam, stamp)
         if match is None:
             res.status = f'no reference ({len(self.store)} kf)'
@@ -84,13 +89,20 @@ class ChangeDetectionPipeline:
             kf = match.keyframe
             ref = self.store.load(kf).astype(np.float32)
             H = rotation_homography(K, kf.K, T_map_cam, kf.T_map_cam)
-            ar = align(cur, valid, ref, valid, H, cfg.align)
+            align_trace = [] if debug else None
+            ar = align(cur, valid, ref, valid, H, cfg.align, trace=align_trace)
+            if debug:
+                res.debug.update(ref=ref, H_prior=H, align_trace=align_trace)
             res.alignment = ar
             head = f'kf{kf.id} d={match.distance:.2f}m a={match.angle_deg:.1f}deg rho={ar.correlation:.2f}'
             if ar.ok:
                 ref_w = warp_to_current(ref, ar.W, (w, h))
                 ref_valid_w = warp_to_current(valid, ar.W, (w, h), cv2.INTER_NEAREST) > 0
-                ch = compute_change(cur, ref_w, ref_valid_w & (valid > 0), cfg.change)
+                change_trace = {} if debug else None
+                ch = compute_change(cur, ref_w, ref_valid_w & (valid > 0), cfg.change,
+                                    trace=change_trace)
+                if debug:
+                    res.debug.update(ref_warped=ref_w, change_trace=change_trace)
                 self.change_tracker.update(ch.blobs, ch.labels, stamp, T_map_cam, K)
                 res.change = ch
                 res.status = f'{head} gain={ch.gain:.3f} sigma={ch.sigma:.1f}'

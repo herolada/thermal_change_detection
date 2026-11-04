@@ -25,6 +25,7 @@ setup(
         'console_scripts': [
             'thermal_change_detection = thermal_change_detection.node:main',
             'offline_eval = thermal_change_detection.offline_eval:main',
+            'debug_report = thermal_change_detection.debug_report:main',
         ],
     },
 )

@@ -127,8 +127,10 @@ def _components(mask, min_area):
         yield lab == i, (x, y, w, h), (float(cents[i, 0]), float(cents[i, 1])), area
 
 
-def compute_change(cur, ref_w, valid, cfg) -> ChangeResult:
-    """cur, ref_w: float32 images in the current frame; valid: bool overlap mask."""
+def compute_change(cur, ref_w, valid, cfg, trace=None) -> ChangeResult:
+    """cur, ref_w: float32 images in the current frame; valid: bool overlap mask.
+
+    ``trace``: optional dict, filled with the intermediate maps (for debugging)."""
     valid = valid.astype(bool)
     if cfg.border_erode_px > 0:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (2 * cfg.border_erode_px + 1,) * 2)
@@ -143,15 +145,23 @@ def compute_change(cur, ref_w, valid, cfg) -> ChangeResult:
     plain = masked_blur(cur - ref_adj, valid, cfg.blur_sigma)
     sigma = max(robust_sigma(plain[valid]), cfg.min_sigma)
 
-    d = neighborhood_diff(cur, ref_adj, valid, cfg.nbhd_radius)
-    d = masked_blur(d, valid, cfg.blur_sigma).astype(np.float32)
+    d_raw = neighborhood_diff(cur, ref_adj, valid, cfg.nbhd_radius)
+    d = masked_blur(d_raw, valid, cfg.blur_sigma).astype(np.float32)
     z = d / np.float32(sigma)
+    if trace is not None:
+        trace.update(valid=valid.copy(), plain=plain, nbhd_raw=d_raw, nbhd_blur=d.copy())
 
     blobs, labels = [], np.zeros(cur.shape[:2], np.int32)
     for sign, kind in ((1.0, 'warmer'), (-1.0, 'colder')):
         zs = np.where(valid, sign * z, 0.0)
         m = hysteresis(zs >= cfg.z_high, zs >= cfg.z_low)
+        if trace is not None:
+            trace[f'{kind}_weak'] = valid & (zs >= cfg.z_low)
+            trace[f'{kind}_strong'] = valid & (zs >= cfg.z_high)
+            trace[f'{kind}_hyst'] = m
         m = morph_open(m, cfg.open_kernel)
+        if trace is not None:
+            trace[f'{kind}_open'] = m
         for sel, bbox, cent, area in _components(m, cfg.min_blob_area):
             vals = d[sel]
             blobs.append(Blob(kind, bbox, cent, area, float(vals.mean()),
