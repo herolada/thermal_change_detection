@@ -1,0 +1,59 @@
+# Parameters of thermal_change_detection. Every section maps 1:1 to a
+# dataclass in thermal_change_detection/core/config.py (see there for docs).
+thermal_change_detection:
+  ros__parameters:
+    map_frame: map
+    camera_frame: ""            # empty -> image header frame_id
+    frame_is_optical: true      # false if camera_frame is x-forward/z-up
+    process_period: 1.0         # [s] process at most one image per period
+    tf_timeout: 0.2             # [s]
+
+    store:
+      r_insert: 0.5             # [m]   store a keyframe if none within r_insert AND theta_insert
+      theta_insert_deg: 5.0
+      r_match: 1.5              # [m]   use a keyframe within r_match AND theta_match ...
+      theta_match_deg: 15.0
+      min_keyframe_age_s: 60.0  # [s]   ... that is at least this old
+      storage_dir: /tmp/thermal_change_detection
+      cleanup_on_exit: true
+
+    align:
+      ecc_enabled: true
+      pyramid_levels: 3
+      max_iterations: 100
+      eps: 1.0e-5
+      gauss_filt_size: 5
+      use_gradient: false
+      min_correlation: 0.6      # quality gate
+      max_correction_px: 80.0
+      min_overlap: 0.3
+
+    change:
+      border_erode_px: 3
+      gain_fit_samples: 20000
+      huber_k: 1.5
+      nbhd_radius: 2            # [px] misalignment tolerance
+      blur_sigma: 2.0           # [px]
+      min_sigma: 2.0            # [image units] noise floor (RAW16 counts)
+      z_low: 3.0                # hysteresis thresholds [noise sigma]
+      z_high: 6.0
+      open_kernel: 5
+      min_blob_area: 30         # [px]
+
+    hotspot:
+      abs_threshold: 0.0        # [image units, RAW16 counts]; 0 = disabled, calibrate first!
+      open_kernel: 3
+      min_blob_area: 10
+
+    persistence:
+      required_frames: 2        # 1 = report blobs immediately
+      max_gap_s: 5.0
+      radius_px: 25
+
+    viz:
+      gray_low_pct: 1.0
+      gray_high_pct: 99.0
+      z_min: 3.0
+      z_max: 12.0
+      alpha_max: 0.75
+      draw_unconfirmed: true
