@@ -8,6 +8,7 @@ Uses TF:     map_frame <- camera optical frame at the stamp of every image
 Publishes:   ~/overlay (bgr8), ~/diff (32FC1, signed, NaN outside overlap),
              ~/reference_warped (mono8), ~/detections (vision_msgs/Detection2DArray)
 """
+import time
 from collections import deque
 
 import numpy as np
@@ -159,11 +160,35 @@ class ThermalChangeDetectionNode(Node):
         heat = None if heat_msg is None else \
             self.bridge.imgmsg_to_cv2(heat_msg, desired_encoding='bgr8')
         K = np.array(info.k).reshape(3, 3)
+        t0 = time.perf_counter()
         res = self.pipeline.process(img, sel.stamp, sel.T_map_cam, K, np.array(info.d),
                                     info.distortion_model, aux=self.aux_frame(sel.stamp),
                                     heatmap=heat)
+        dt_ms = 1e3 * (time.perf_counter() - t0)
         self.get_logger().debug(f'{res.status} [{sel.reason}]')
+        self.get_logger().info(self.summary(res, dt_ms))
         self.publish(res, msg.header)
+
+    def summary(self, res, dt_ms):
+        """One human-readable log line per processed image."""
+        parts = [f'processed in {dt_ms:.0f} ms']
+        m, a = res.match, res.alignment
+        if m is None:
+            parts.append('no keyframe to compare with')
+        else:
+            what = (f'matched keyframe {m.keyframe.id} ({m.distance:.2f} m, '
+                    f'{m.angle_deg:.1f} deg away')
+            if a is not None and a.ok:
+                parts.append(f'{what}, match {100 * max(a.correlation, 0.0):.0f}%)')
+                n = len(res.detections)
+                parts.append(f'{n} change{"" if n == 1 else "s"} detected')
+            else:
+                reason = a.reason if a is not None else 'not aligned'
+                parts.append(f'{what}) but alignment rejected: {reason}')
+        if res.inserted is not None:
+            parts.append(f'new keyframe {res.inserted.id} '
+                         f'({len(self.pipeline.store)} stored)')
+        return ' | '.join(parts)
 
     def aux_frame(self, t):
         """(image, stamp, T_map_cam) of the buffered frame closest to

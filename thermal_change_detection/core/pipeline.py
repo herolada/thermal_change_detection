@@ -17,7 +17,7 @@ from .geometry import rotation_homography
 from .keyframe_store import Keyframe, KeyframeStore, Match
 from .persistence import PersistenceTracker
 from .stability import StabilityResult, drop_unstable, map_aux_to_current, measure
-from .viz import render, render_on_heatmap, to_gray8
+from .viz import blob_masks, quality_pct, render, render_on_heatmap, to_gray8
 
 
 @dataclass
@@ -61,17 +61,6 @@ class ChangeDetectionPipeline:
         if self._undist is None or not self._undist.matches(K, D, size, model):
             self._undist = Undistorter(K, D, size, model)
         return self._undist
-
-    def _blob_pixels(self, change, hot_blobs, hot_labels):
-        """bool mask of the pixels of the blobs that get drawn."""
-        show = lambda b: b.confirmed or self.cfg.viz.draw_unconfirmed  # noqa: E731
-        mask = np.zeros(hot_labels.shape, bool)
-        for blobs, labels in ((change.blobs, change.labels) if change else ([], None),
-                              (hot_blobs, hot_labels)):
-            if blobs:
-                lut = np.array([False] + [show(b) for b in blobs])
-                mask |= lut[labels]
-        return mask
 
     def _check_stability(self, aux, stamp, T_map_cam, K, und, kf, ref, ar, ch, debug):
         """Compare the blobs of ``ch`` with those of the auxiliary frame
@@ -142,7 +131,8 @@ class ChangeDetectionPipeline:
             if debug:
                 res.debug.update(ref=ref, H_prior=H, align_trace=align_trace)
             res.alignment = ar
-            head = f'kf{kf.id} d={match.distance:.2f}m a={match.angle_deg:.1f}deg rho={ar.correlation:.2f}'
+            head = (f'kf{kf.id} transl={match.distance:.2f}m rot={match.angle_deg:.1f}deg '
+                    f'match={100 * max(ar.correlation, 0.0):.0f}%')
             if ar.fallback:
                 head += f' FALLBACK(corr {ar.correction_px:.0f}>{ar.bound_px:.0f}px)'
             if ar.ok:
@@ -163,7 +153,8 @@ class ChangeDetectionPipeline:
                         res.stability = StabilityResult('no blobs')
                 self.change_tracker.update(ch.blobs, ch.labels, stamp, T_map_cam, K)
                 res.change = ch
-                res.status = f'{head} gain={ch.gain:.3f} sigma={ch.sigma:.1f}'
+                res.status = (f'{head} gain={ch.gain:.3f} '
+                              f'quality={quality_pct(ch.sigma, cfg.viz):.0f}%')
                 if res.stability is not None and res.stability.removed:
                     res.status += f' unstable={len(res.stability.removed)}'
             else:
@@ -176,7 +167,8 @@ class ChangeDetectionPipeline:
         res.blobs = (res.change.blobs if res.change else []) + hot_blobs
         drawn = res.blobs + (res.stability.removed if res.stability else [])
         back = cfg.viz.distort_overlay
-        res.overlay, (lo, hi) = render(cur, valid, res.change, drawn, res.status, cfg.viz,
+        masks = blob_masks(res.change, hot_blobs, hot_labels, cfg.viz)
+        res.overlay, (lo, hi) = render(cur, valid, res.change, drawn, masks, res.status, cfg.viz,
                                        show_colder=cfg.change.detect_colder,
                                        und=und if back else None, raw=img if back else None)
         if heatmap is not None:
@@ -188,8 +180,7 @@ class ChangeDetectionPipeline:
             if hm.shape[:2] != (h, w):
                 hm = cv2.resize(hm, (w, h), interpolation=cv2.INTER_AREA
                                 if hm.shape[0] > h else cv2.INTER_LINEAR)
-            fill = self._blob_pixels(res.change, hot_blobs, hot_labels)
-            res.overlay = render_on_heatmap(hm, res.change, drawn, fill, res.status,
+            res.overlay = render_on_heatmap(hm, res.change, drawn, masks, hi - lo, res.status,
                                             cfg.viz, und, back)
         if res.change is not None:
             ref_view = np.where(res.change.valid, res.change.ref_adjusted, np.nan)

@@ -310,10 +310,12 @@ def test_pipeline_end_to_end(canvas, tmp_path):
     assert kinds.count('warmer') == 2 and kinds.count('hotspot') == 1, r.status
     assert any(abs(b.centroid[0] - 250) < 6 and abs(b.centroid[1] - 200) < 6
                for b in r.detections if b.kind == 'warmer')
-    # overlay drawn on the heatmap: blob pixels tinted white, the rest untouched
+    # overlay drawn on the heatmap: blobs outlined in white, interior and the rest untouched
     assert r.overlay.shape == (H, W, 3)
-    assert r.overlay[200, 250, 1] > 80 and r.overlay[200, 250, 0] > 80
+    assert tuple(r.overlay[200, 250]) == (80, 0, 0)
+    assert (r.overlay[175:225, 225:275].min(axis=2) > 200).any()
     assert tuple(r.overlay[100, 320]) == (80, 0, 0)
+    assert 'match=' in r.status and 'quality=' in r.status
     p.close()
 
 

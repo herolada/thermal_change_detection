@@ -144,9 +144,11 @@ class VizConfig:
     # Only the overlay changes; ~/diff, ~/reference_warped and ~/detections
     # stay in undistorted coordinates.
     distort_overlay: bool = False
-    # Overlay on the external heatmap image (node param heatmap_topic):
-    # opacity of the white tint over the detected blob pixels.
-    heatmap_fill_alpha: float = 0.45
+    outline_thickness: int = 1          # [px] blob outline
+    # Status-line "quality" = noise sigma mapped linearly to 100 % (at or below
+    # quality_sigma_good) .. 0 % (at or above quality_sigma_bad) [image units].
+    quality_sigma_good: float = 8.0
+    quality_sigma_bad: float = 40.0
 
 
 @dataclass

@@ -109,11 +109,18 @@ requiring instability at two lookbacks.
 |---|---|---|
 | in | `image` (default remap `/flir_boson/image_raw`) | `sensor_msgs/Image`, mono16 preferred |
 | in | `camera_info` (default `/flir_boson/camera_info`) | `sensor_msgs/CameraInfo` |
-| in | param `heatmap_topic` (optional, off if empty) | `sensor_msgs/Image`, false-colour view of the same camera (same aspect ratio, paired by stamp within `heatmap_max_dt`); `~/overlay` is then drawn on it: white = warmer, cyan = colder, green = hotspot, blob pixels tinted white |
+| in | param `heatmap_topic` (optional, off if empty) | `sensor_msgs/Image`, false-colour view of the same camera (same aspect ratio, paired by stamp within `heatmap_max_dt`); `~/overlay` is then drawn on it: white = warmer, cyan = colder, green = hotspot (blob outlines) |
 | out | `~/overlay` | bgr8: red/yellow warmer, blue/cyan colder, hatched = no overlap; undistorted image, or the original one with `viz.distort_overlay: true` |
 | out | `~/diff` | 32FC1 signed difference in image units, NaN outside overlap |
 | out | `~/reference_warped` | mono8 aligned reference, same scaling as overlay |
 | out | `~/detections` | `vision_msgs/Detection2DArray`, class `warmer`/`colder`/`hotspot` |
+
+Overlay text. Status line, e.g. `kf54 transl=0.30m rot=2.4deg match=87% gain=1.003 quality=59%`:
+the matched keyframe, its translation / viewing-angle difference to the current pose,
+`match` = correlation of the aligned images, `gain` = fitted `cur ≈ gain·ref + offset`,
+`quality` = noise sigma mapped to 100 % (≤ `viz.quality_sigma_good`) .. 0 %
+(≥ `viz.quality_sigma_bad`). Blob labels (`+33%`): mean difference of the blob in % of
+the scene contrast (the `gray_low_pct`..`gray_high_pct` intensity range of the current image).
 
 Run the Boson in **`video_mode:=RAW16`**: AGC modes rescale every frame, which
 breaks the comparison.
