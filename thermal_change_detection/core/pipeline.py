@@ -17,7 +17,7 @@ from .geometry import rotation_homography
 from .keyframe_store import Keyframe, KeyframeStore, Match
 from .persistence import PersistenceTracker
 from .stability import StabilityResult, drop_unstable, map_aux_to_current, measure
-from .viz import render, to_gray8
+from .viz import render, render_on_heatmap, to_gray8
 
 
 @dataclass
@@ -62,6 +62,17 @@ class ChangeDetectionPipeline:
             self._undist = Undistorter(K, D, size, model)
         return self._undist
 
+    def _blob_pixels(self, change, hot_blobs, hot_labels):
+        """bool mask of the pixels of the blobs that get drawn."""
+        show = lambda b: b.confirmed or self.cfg.viz.draw_unconfirmed  # noqa: E731
+        mask = np.zeros(hot_labels.shape, bool)
+        for blobs, labels in ((change.blobs, change.labels) if change else ([], None),
+                              (hot_blobs, hot_labels)):
+            if blobs:
+                lut = np.array([False] + [show(b) for b in blobs])
+                mask |= lut[labels]
+        return mask
+
     def _check_stability(self, aux, stamp, T_map_cam, K, und, kf, ref, ar, ch, debug):
         """Compare the blobs of ``ch`` with those of the auxiliary frame
         (image, stamp, T_map_cam) against the same keyframe; drops unstable blobs."""
@@ -93,11 +104,13 @@ class ChangeDetectionPipeline:
         return st
 
     def process(self, image, stamp, T_map_cam, K, D=None, distortion_model='plumb_bob',
-                debug=False, aux=None):
+                debug=False, aux=None, heatmap=None):
         """image: mono8/mono16 (or BGR, converted to gray); stamp in seconds;
         T_map_cam: 4x4 optical-frame camera pose; K: 3x3; D: distortion coeffs.
         aux: optional (image, stamp, T_map_cam) of an earlier frame of the same
         camera, for the stability check (``stability.enabled``).
+        heatmap: optional false-colour image (BGR or mono, original camera
+        geometry, same aspect ratio) to draw the overlay on instead.
         debug=True keeps the intermediate images/warps in ``FrameResult.debug``."""
         cfg = self.cfg
         K = np.asarray(K, dtype=np.float64).reshape(3, 3)
@@ -166,6 +179,18 @@ class ChangeDetectionPipeline:
         res.overlay, (lo, hi) = render(cur, valid, res.change, drawn, res.status, cfg.viz,
                                        show_colder=cfg.change.detect_colder,
                                        und=und if back else None, raw=img if back else None)
+        if heatmap is not None:
+            hm = np.asarray(heatmap)
+            if hm.ndim == 2:
+                hm = cv2.cvtColor(hm, cv2.COLOR_GRAY2BGR)
+            elif hm.shape[2] == 4:
+                hm = cv2.cvtColor(hm, cv2.COLOR_BGRA2BGR)
+            if hm.shape[:2] != (h, w):
+                hm = cv2.resize(hm, (w, h), interpolation=cv2.INTER_AREA
+                                if hm.shape[0] > h else cv2.INTER_LINEAR)
+            fill = self._blob_pixels(res.change, hot_blobs, hot_labels)
+            res.overlay = render_on_heatmap(hm, res.change, drawn, fill, res.status,
+                                            cfg.viz, und, back)
         if res.change is not None:
             ref_view = np.where(res.change.valid, res.change.ref_adjusted, np.nan)
             res.reference_view = to_gray8(ref_view, lo, hi)

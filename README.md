@@ -109,6 +109,7 @@ requiring instability at two lookbacks.
 |---|---|---|
 | in | `image` (default remap `/flir_boson/image_raw`) | `sensor_msgs/Image`, mono16 preferred |
 | in | `camera_info` (default `/flir_boson/camera_info`) | `sensor_msgs/CameraInfo` |
+| in | param `heatmap_topic` (optional, off if empty) | `sensor_msgs/Image`, false-colour view of the same camera (same aspect ratio, paired by stamp within `heatmap_max_dt`); `~/overlay` is then drawn on it: white = warmer, cyan = colder, green = hotspot, blob pixels tinted white |
 | out | `~/overlay` | bgr8: red/yellow warmer, blue/cyan colder, hatched = no overlap; undistorted image, or the original one with `viz.distort_overlay: true` |
 | out | `~/diff` | 32FC1 signed difference in image units, NaN outside overlap |
 | out | `~/reference_warped` | mono8 aligned reference, same scaling as overlay |

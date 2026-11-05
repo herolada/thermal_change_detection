@@ -1,6 +1,8 @@
 """Thin ROS 2 wrapper around core.ChangeDetectionPipeline.
 
-Subscribes:  image (sensor_msgs/Image, mono16 RAW16 preferred), camera_info
+Subscribes:  image (sensor_msgs/Image, mono16 RAW16 preferred), camera_info,
+             optionally heatmap_topic (sensor_msgs/Image, false-colour view of
+             the same camera: ~/overlay is then drawn on it)
 Uses TF:     map_frame <- camera optical frame at the stamp of every image
              (cheap, ~0.2 ms); core.frame_select picks the images to process
 Publishes:   ~/overlay (bgr8), ~/diff (32FC1, signed, NaN outside overlap),
@@ -42,6 +44,10 @@ class ThermalChangeDetectionNode(Node):
         # Max time [s, image-stamp time] an image may wait for its TF before
         # it is dropped. Waiting is non-blocking (retried on newer images).
         self.tf_timeout = self.declare_parameter('tf_timeout', 0.5).value
+        # Optional false-colour image of the same camera (original geometry,
+        # same aspect ratio) that ~/overlay is drawn on. Empty -> off.
+        self.heatmap_topic = self.declare_parameter('heatmap_topic', '').value
+        self.heatmap_max_dt = self.declare_parameter('heatmap_max_dt', 0.02).value
 
         cfg = PipelineConfig()
         defaults = flatten(cfg)
@@ -58,6 +64,7 @@ class ThermalChangeDetectionNode(Node):
         self.camera_info = None
         self.selector = FrameSelector(cfg.select, self.pipeline.store)
         self.unposed = deque()   # (stamp, msg) waiting for their TF, in order
+        self.heatmaps = deque()  # (stamp, msg), paired with images before selection
         st, sel = cfg.stability, cfg.select
         # Recent raw images for the stability check (TF looked up only when
         # used). The selector may hold a frame for up to max(period, max_period).
@@ -69,6 +76,11 @@ class ThermalChangeDetectionNode(Node):
                                 reliability=ReliabilityPolicy.BEST_EFFORT)
         self.create_subscription(CameraInfo, 'camera_info', self.on_camera_info, sensor_qos)
         self.create_subscription(Image, 'image', self.on_image, sensor_qos)
+        if self.heatmap_topic:
+            self.create_subscription(Image, self.heatmap_topic, self.on_heatmap,
+                                     QoSProfile(depth=10, history=HistoryPolicy.KEEP_LAST,
+                                                reliability=ReliabilityPolicy.BEST_EFFORT))
+            self.get_logger().info(f'overlay drawn on {self.heatmap_topic}')
         self.pub_overlay = self.create_publisher(Image, '~/overlay', 2)
         self.pub_diff = self.create_publisher(Image, '~/diff', 2)
         self.pub_ref = self.create_publisher(Image, '~/reference_warped', 2)
@@ -76,6 +88,28 @@ class ThermalChangeDetectionNode(Node):
 
     def on_camera_info(self, msg):
         self.camera_info = msg
+
+    def on_heatmap(self, msg):
+        t = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
+        self.heatmaps.append((t, msg))
+        while t - self.heatmaps[0][0] > self.tf_timeout + 1.0:   # camera image stalled
+            self.heatmaps.popleft()
+
+    def pair_heatmap(self, t, now):
+        """Heatmap msg closest to stamp t (within heatmap_max_dt), None if
+        there is none, or False if it may still arrive (wait)."""
+        q, tol = self.heatmaps, self.heatmap_max_dt
+        while q and q[0][0] < t - tol:              # too old for t and every later image
+            q.popleft()
+        best = min(((abs(s - t), m) for s, m in q if abs(s - t) <= tol),
+                   key=lambda e: e[0], default=None)
+        if best is not None:
+            return best[1]
+        if (q and q[-1][0] > t + tol) or now - t > self.tf_timeout:
+            self.get_logger().warning(f'no heatmap within {tol:.3f} s of image, '
+                                      'drawing on the camera image', throttle_duration_sec=5.0)
+            return None
+        return False
 
     def on_image(self, msg):
         info = self.camera_info
@@ -101,8 +135,13 @@ class ThermalChangeDetectionNode(Node):
                     f'available within {self.tf_timeout:.2f} s, dropping image: {e}',
                     throttle_duration_sec=5.0)
                 continue
+            heat = None
+            if self.heatmap_topic:
+                heat = self.pair_heatmap(ft, t)
+                if heat is False:                   # not received yet: retry next image
+                    break
             self.unposed.popleft()
-            sel = self.selector.push(ft, T, fmsg)
+            sel = self.selector.push(ft, T, (fmsg, heat))
             if sel is not None:
                 self.process(sel, info)
 
@@ -115,11 +154,14 @@ class ThermalChangeDetectionNode(Node):
         return T if self.frame_is_optical else T @ T_BODY_OPTICAL
 
     def process(self, sel, info):
-        msg = sel.item
+        msg, heat_msg = sel.item
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        heat = None if heat_msg is None else \
+            self.bridge.imgmsg_to_cv2(heat_msg, desired_encoding='bgr8')
         K = np.array(info.k).reshape(3, 3)
         res = self.pipeline.process(img, sel.stamp, sel.T_map_cam, K, np.array(info.d),
-                                    info.distortion_model, aux=self.aux_frame(sel.stamp))
+                                    info.distortion_model, aux=self.aux_frame(sel.stamp),
+                                    heatmap=heat)
         self.get_logger().debug(f'{res.status} [{sel.reason}]')
         self.publish(res, msg.header)
 

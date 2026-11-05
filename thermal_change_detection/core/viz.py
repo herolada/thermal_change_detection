@@ -7,6 +7,9 @@ import cv2
 import numpy as np
 
 COLORS = {'warmer': (0, 0, 255), 'colder': (255, 80, 0), 'hotspot': (255, 0, 255)}
+# On a false-colour heatmap (warm = red/yellow already): white = warmer,
+# cyan = colder, green = hotspot.
+HEATMAP_COLORS = {'warmer': (255, 255, 255), 'colder': (255, 255, 0), 'hotspot': (0, 255, 0)}
 
 
 def gray_limits(img, valid, lo_pct, hi_pct):
@@ -33,14 +36,14 @@ def _heat_colors(z, z_max):
     return col
 
 
-def _draw_blob(img, b, draw_unconfirmed):
+def _draw_blob(img, b, draw_unconfirmed, colors=COLORS):
     if not b.confirmed and not draw_unconfirmed:
         return
     x, y, w, h = b.bbox
     if not b.stable:   # dropped by the stability check: thin gray box
         cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), (150, 150, 150), 1)
         return
-    color = COLORS.get(b.kind, (255, 255, 255))
+    color = colors.get(b.kind, (255, 255, 255))
     cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), color, 2 if b.confirmed else 1)
     if b.confirmed:
         if b.kind == 'hotspot':   # label below the box, change labels go above
@@ -76,21 +79,50 @@ def render(cur, cur_valid, change, blobs, status, cfg, show_colder=True, und=Non
             valid = und.distort_back(valid.astype(np.uint8), cv2.INTER_NEAREST) > 0
         out = out * (1.0 - alpha[..., None]) + heat * alpha[..., None]
 
-        # Non-overlap: darkened with diagonal hatching.
-        h, w = valid.shape
-        yy, xx = np.mgrid[0:h, 0:w]
-        hatch = ((xx + yy) % 12) < 2
-        inv = ~valid
-        out[inv] = out[inv] * 0.45 + 40.0
-        out[inv & hatch] = 110.0
+    out = _hatch_invalid(out, valid) if change is not None else out
+    return _finish(out, blobs, status, cfg, und if back else None, COLORS), (lo, hi)
 
+
+def _hatch_invalid(out, valid):
+    """Non-overlap: darkened with diagonal hatching."""
+    h, w = valid.shape
+    yy, xx = np.mgrid[0:h, 0:w]
+    hatch = ((xx + yy) % 12) < 2
+    inv = ~valid
+    out[inv] = out[inv] * 0.45 + 40.0
+    out[inv & hatch] = 110.0
+    return out
+
+
+def _finish(out, blobs, status, cfg, und, colors):
+    """Boxes (mapped through the lens model if ``und``) and the status line."""
     out = np.clip(out, 0, 255).astype(np.uint8)
     for b in blobs:
-        if back:
+        if und is not None:
             b = replace(b, bbox=und.distort_bbox(b.bbox))
-        _draw_blob(out, b, cfg.draw_unconfirmed)
-
+        _draw_blob(out, b, cfg.draw_unconfirmed, colors)
     cv2.rectangle(out, (0, 0), (out.shape[1], 18), (0, 0, 0), -1)
     cv2.putText(out, status, (4, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1,
                 cv2.LINE_AA)
-    return out, (lo, hi)
+    return out
+
+
+def render_on_heatmap(heatmap, change, blobs, fill, status, cfg, und, back):
+    """Detections drawn on an external false-colour image (bgr8, original
+    camera geometry, same size as the camera image): blob pixels ``fill``
+    (bool, undistorted px) tinted white, boxes in HEATMAP_COLORS, hatched
+    non-overlap. ``back``: stay in the original geometry (viz.distort_overlay),
+    else the heatmap is undistorted like the camera image."""
+    valid = change.valid if change is not None else None
+    if back:
+        fill = und.distort_back(fill.astype(np.uint8), cv2.INTER_NEAREST) > 0
+        if valid is not None:
+            valid = und.distort_back(valid.astype(np.uint8), cv2.INTER_NEAREST) > 0
+        out = heatmap.astype(np.float32)
+    else:
+        out = und.undistort(heatmap).astype(np.float32)
+    a = cfg.heatmap_fill_alpha
+    out[fill] = out[fill] * (1.0 - a) + 255.0 * a
+    if valid is not None:
+        out = _hatch_invalid(out, valid)
+    return _finish(out, blobs, status, cfg, und if back else None, HEATMAP_COLORS)

@@ -299,7 +299,10 @@ def test_pipeline_end_to_end(canvas, tmp_path):
     cfg.hotspot.abs_threshold = float(base.max()) + 500.0
     img = add_blob(base, 250, 200, 200.0)
     img = add_blob(img, 500, 400, 6000.0, sigma=4)  # very hot -> also a hotspot
-    r = p.process(np.clip(img, 0, 65535).astype(np.uint16), 100.0, T_meas, K, D)
+    heat = np.zeros((H // 2, W // 2, 3), np.uint8)   # false-colour image at half resolution
+    heat[..., 0] = 80
+    r = p.process(np.clip(img, 0, 65535).astype(np.uint16), 100.0, T_meas, K, D,
+                  heatmap=heat)
     assert r.match is not None and r.inserted is None
     assert r.alignment.ok, r.status
     assert r.change is not None and r.reference_view is not None
@@ -307,6 +310,10 @@ def test_pipeline_end_to_end(canvas, tmp_path):
     assert kinds.count('warmer') == 2 and kinds.count('hotspot') == 1, r.status
     assert any(abs(b.centroid[0] - 250) < 6 and abs(b.centroid[1] - 200) < 6
                for b in r.detections if b.kind == 'warmer')
+    # overlay drawn on the heatmap: blob pixels tinted white, the rest untouched
+    assert r.overlay.shape == (H, W, 3)
+    assert r.overlay[200, 250, 1] > 80 and r.overlay[200, 250, 0] > 80
+    assert tuple(r.overlay[100, 320]) == (80, 0, 0)
     p.close()
 
 
@@ -317,7 +324,8 @@ def test_params_yaml_in_sync_with_config():
     path = os.path.join(os.path.dirname(__file__), '..', 'config', 'params.yaml')
     with open(path) as f:
         params = _flatten_dict(yaml.safe_load(f)['thermal_change_detection']['ros__parameters'])
-    node_only = {'map_frame', 'camera_frame', 'frame_is_optical', 'tf_timeout'}
+    node_only = {'map_frame', 'camera_frame', 'frame_is_optical', 'tf_timeout',
+                 'heatmap_topic', 'heatmap_max_dt'}
     defaults = flatten(PipelineConfig())
     assert set(params) - node_only == set(defaults)
     for k, v in defaults.items():
