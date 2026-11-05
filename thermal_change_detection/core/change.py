@@ -28,6 +28,8 @@ class Blob:
     peak_z: float             # largest |z| inside the blob (0 for hotspots)
     persistence: int = 1      # consecutive frames this blob has been seen
     confirmed: bool = True
+    size_change: Optional[float] = None  # stability check: 0 = same size .. 1 = vanished
+    stable: bool = True                  # False: dropped by the stability check
 
 
 @dataclass
@@ -153,7 +155,10 @@ def compute_change(cur, ref_w, valid, cfg, trace=None) -> ChangeResult:
 
     blobs, labels = [], np.zeros(cur.shape[:2], np.int32)
     for sign, kind in ((1.0, 'warmer'), (-1.0, 'colder')):
-        zs = np.where(valid, sign * z, 0.0)
+        if kind == 'colder' and not cfg.detect_colder:
+            zs = np.zeros_like(z)                   # empty masks (traces stay complete)
+        else:
+            zs = np.where(valid, sign * z, 0.0)
         m = hysteresis(zs >= cfg.z_high, zs >= cfg.z_low)
         if trace is not None:
             trace[f'{kind}_weak'] = valid & (zs >= cfg.z_low)

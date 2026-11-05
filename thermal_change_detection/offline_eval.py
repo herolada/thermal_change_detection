@@ -21,8 +21,10 @@ from rosidl_runtime_py.utilities import get_message
 from tf2_ros import Buffer, TransformException
 
 from .core.config import PipelineConfig, load_ros_params_yaml
+from .core.frame_select import FrameSelector
 from .core.geometry import T_BODY_OPTICAL
 from .core.pipeline import ChangeDetectionPipeline
+from .core.stability import FrameBuffer
 from .node import tf_to_matrix
 
 
@@ -37,7 +39,7 @@ def open_reader(bag, topics):
 
 
 def add_bag_args(ap):
-    """Arguments shared by the offline tools (bag, topics, frames, period)."""
+    """Arguments shared by the offline tools (bag, topics, frames)."""
     ap.add_argument('bag')
     ap.add_argument('--params', help='ROS params yaml (same format as config/params.yaml)')
     ap.add_argument('--image', default='/flir_boson/image_raw',
@@ -47,7 +49,6 @@ def add_bag_args(ap):
     ap.add_argument('--camera-frame', default='', help='default: image header frame_id')
     ap.add_argument('--not-optical', action='store_true',
                     help='camera frame is x-forward/z-up instead of optical')
-    ap.add_argument('--period', type=float, default=1.0)
     ap.add_argument('--max-frames', type=int, default=0)
 
 
@@ -69,15 +70,35 @@ def load_tf(bag):
     return tf_buffer
 
 
-def iter_frames(args, tf_buffer):
-    """Pass 2: yield (stamp_s, image, T_map_cam, camera_info) at most once per
-    ``args.period``, the same subsampling as the node."""
+def iter_frames(args, tf_buffer, cfg, store):
+    """Pass 2: yield (stamp_s, image, T_map_cam, camera_info, aux, selected) for
+    the frames core.frame_select picks (``cfg.select``, same as the node; the
+    caller must process each one before the next is drawn, since the choice
+    depends on the keyframes in ``store``). ``aux`` is the (image, stamp_s,
+    T_map_cam) of the frame closest to ``stability.lookback_s`` earlier (for
+    the stability check), or None (disabled / none buffered)."""
     bridge = CvBridge()
     reader, types = open_reader(args.bag, [args.image, args.camera_info])
     if args.image not in types:
         raise SystemExit(f'topic {args.image} not in bag')
     compressed = types[args.image].endswith('CompressedImage')
-    info, last_t = None, None
+
+    def decode(msg):
+        if compressed:
+            return cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_UNCHANGED)
+        return bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+
+    def pose(msg, stamp):
+        frame = args.camera_frame or msg.header.frame_id
+        T = tf_to_matrix(tf_buffer.lookup_transform(args.map_frame, frame, stamp))
+        return T @ T_BODY_OPTICAL if args.not_optical else T
+
+    lookback_s = cfg.stability.lookback_s if cfg.stability.enabled else 0.0
+    sel_cfg = cfg.select
+    selector = FrameSelector(sel_cfg, store)
+    hold = max(sel_cfg.period, sel_cfg.max_period) if sel_cfg.mode == 'closest' else 0.0
+    recent = FrameBuffer(hold + 2.0 * lookback_s + 0.5) if lookback_s > 0 else None
+    info, n_no_tf = None, 0
     while reader.has_next():
         topic, data, _ = reader.read_next()
         msg = deserialize_message(data, get_message(types[topic]))
@@ -88,22 +109,30 @@ def iter_frames(args, tf_buffer):
             continue
         stamp = Time.from_msg(msg.header.stamp)
         t = stamp.nanoseconds * 1e-9
-        if last_t is not None and 0.0 <= t - last_t < args.period:
-            continue
-        frame = args.camera_frame or msg.header.frame_id
+        if recent is not None:
+            recent.push(t, msg)
         try:
-            T = tf_to_matrix(tf_buffer.lookup_transform(args.map_frame, frame, stamp))
+            T = pose(msg, stamp)
         except TransformException as e:
-            print(f'  skip {t:.2f}: {e}')
+            if n_no_tf == 0:
+                print(f'  no TF for {t:.2f} (further ones only counted): {e}')
+            n_no_tf += 1
             continue
-        if args.not_optical:
-            T = T @ T_BODY_OPTICAL
-        if compressed:
-            img = cv2.imdecode(np.frombuffer(msg.data, np.uint8), cv2.IMREAD_UNCHANGED)
-        else:
-            img = bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-        last_t = t
-        yield t, img, T, info
+        sel = selector.push(t, T, msg)
+        if sel is None:
+            continue
+        t, msg = sel.stamp, sel.item
+        aux = None
+        picked = recent.pick(t, lookback_s) if recent is not None else None
+        if picked is not None:
+            a_t, a_msg = picked
+            try:
+                aux = (decode(a_msg), a_t, pose(a_msg, Time.from_msg(a_msg.header.stamp)))
+            except TransformException:
+                pass
+        yield t, decode(msg), sel.T_map_cam, info, aux, sel
+    if n_no_tf:
+        print(f'  {n_no_tf} images without TF skipped')
 
 
 def main():
@@ -126,22 +155,23 @@ def main():
     n = 0
     log = open(os.path.join(args.out, 'log.csv'), 'w', newline='')
     writer = csv.writer(log)
-    writer.writerow(['frame', 'stamp', 'keyframe', 'distance', 'angle_deg', 'correlation',
-                     'aligned', 'gain', 'sigma', 'n_detections', 'inserted', 'status'])
+    writer.writerow(['frame', 'stamp', 'select', 'keyframe', 'distance', 'angle_deg',
+                     'correlation', 'aligned', 'gain', 'sigma', 'n_detections', 'inserted',
+                     'status'])
     try:
-        for t, img, T, info in iter_frames(args, tf_buffer):
+        for t, img, T, info, aux, sel in iter_frames(args, tf_buffer, cfg, pipeline.store):
             res = pipeline.process(img, t, T, np.array(info.k).reshape(3, 3),
-                                   np.array(info.d), info.distortion_model)
+                                   np.array(info.d), info.distortion_model, aux=aux)
             cv2.imwrite(os.path.join(args.out, f'overlay_{n:05d}.png'), res.overlay)
             if res.reference_view is not None:
                 cv2.imwrite(os.path.join(args.out, f'reference_{n:05d}.png'), res.reference_view)
             m, a, c = res.match, res.alignment, res.change
             writer.writerow([
-                n, f'{t:.3f}', m.keyframe.id if m else '', f'{m.distance:.3f}' if m else '',
+                n, f'{t:.3f}', sel.reason, m.keyframe.id if m else '', f'{m.distance:.3f}' if m else '',
                 f'{m.angle_deg:.2f}' if m else '', f'{a.correlation:.3f}' if a else '',
                 int(a.ok) if a else '', f'{c.gain:.4f}' if c else '', f'{c.sigma:.2f}' if c else '',
                 len(res.detections), res.inserted.id if res.inserted else '', res.status])
-            print(f'  [{n}] {res.status}')
+            print(f'  [{n}] {res.status} [{sel.reason}]')
             n += 1
             if args.max_frames and n >= args.max_frames:
                 break

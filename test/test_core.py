@@ -105,10 +105,82 @@ def test_ecc_corrects_pose_error(canvas):
     T_cur_noisy = pose(rot(6.5, 0.2, 0.8))  # ~1.5 deg heading error -> ~14 px
     H_prior = rotation_homography(K, K, T_cur_noisy, T_ref)
     assert corner_err(np.linalg.inv(H_prior), W_true) > 10
-    res = align(cur, valid, ref, valid, H_prior, AlignConfig())
+    for features, tol in (('intensity', 1.0), ('edges', 1.5)):  # edges: blurred, less exact
+        res = align(cur, valid, ref, valid, H_prior, AlignConfig(features=features))
+        assert res.ok, res.reason
+        assert not res.fallback
+        assert corner_err(res.W, W_true) < tol, features
+        assert res.correlation > 0.95
+
+
+def test_edges_ignore_bright_object(canvas):
+    """A large hot object (person) in the reference only must not drag the
+    alignment, and must not make the gate reject a correct alignment."""
+    valid = np.ones((H, W), np.uint8)
+    T_ref, T_cur = pose(rot(0)), pose(rot(4, 1))
+    ref = render_view(canvas, T_ref, noise=3, seed=1)
+    ref[150:420, 380:470] += 3000.0          # person: ~10x the scene contrast
+    cur = render_view(canvas, T_cur, noise=3, seed=2)
+    W_true = np.linalg.inv(rotation_homography(K, K, T_cur, T_ref))
+    H_prior = rotation_homography(K, K, pose(rot(5.2, 0.5)), T_ref)
+    res = align(cur, valid, ref, valid, H_prior, AlignConfig(features='edges'))
     assert res.ok, res.reason
+    assert corner_err(res.W, W_true) < 2.0
+
+
+def test_implausible_refinement_falls_back_to_prior(canvas):
+    valid = np.ones((H, W), np.uint8)
+    T_ref, T_cur = pose(rot(0)), pose(rot(5, 1))
+    ref = render_view(canvas, T_ref, noise=3, seed=1)
+    cur = render_view(canvas, T_cur, noise=3, seed=2)
+    H_prior = rotation_homography(K, K, pose(rot(6.5, 0.2, 0.8)), T_ref)  # ~14 px off
+    cfg = AlignConfig(disp_base_px=5.0)
+    res = align(cur, valid, ref, valid, H_prior, cfg, T_map_cur=T_cur, T_map_ref=T_ref,
+                K_cur=K, K_ref=K)
+    assert res.fallback and res.correction_px > res.bound_px == pytest.approx(5.0)
+    assert np.allclose(res.W, res.W0)
+    # translation widens the bound: 0.5 m at >= 5 m depth -> +52 px
+    T_cur_t = pose(rot(5, 1), (0.5, 0, 0))
+    res = align(cur, valid, ref, valid, H_prior, cfg, T_map_cur=T_cur_t, T_map_ref=T_ref,
+                K_cur=K, K_ref=K)
+    assert not res.fallback and res.bound_px == pytest.approx(5.0 + 520.0 * 0.5 / 5.0)
+
+
+def test_plane_parallax_recovers_translation_and_heading_error(canvas):
+    """Planar scene at 10 m, camera translated by 0.6 m: the rotation-only prior
+    is off by the parallax plus a 1 deg heading error; the plane+parallax model
+    explains both with its 6 physical parameters."""
+    Z = 10.0
+    T_ref = pose(rot(0))
+    T_cur = pose(rot(3, 0.5), (0.5, 0.05, 0.3))
+    # exact plane-induced warp current px -> reference px (plane z = Z in ref frame)
+    R, t = T_cur[:3, :3], T_cur[:3, 3]
+    n_c = R.T @ np.array([0, 0, 1.0])
+    W_true = K @ (R + np.outer(t, n_c) / (Z - t[2])) @ np.linalg.inv(K)
+    W_true /= W_true[2, 2]
+    M_ref = K_CANVAS @ np.linalg.inv(K)       # ref view px -> canvas px
+    ref = render_view(canvas, T_ref, noise=3, seed=1)
+    cur = cv2.warpPerspective(canvas, M_ref @ W_true, (W, H),
+                              flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP)
+    cur = cur + np.random.default_rng(2).normal(0, 3, cur.shape).astype(np.float32)
+    valid = np.ones((H, W), np.uint8)
+    T_meas = pose(rot(4, 0.5), (0.5, 0.05, 0.3))   # 1 deg heading error
+    H_prior = rotation_homography(K, K, T_meas, T_ref)
+    assert corner_err(np.linalg.inv(H_prior), W_true) > 15
+    cfg = AlignConfig(method='plane_parallax', features='edges')
+    trace = []
+    res = align(cur, valid, ref, valid, H_prior, cfg, trace=trace, T_map_cur=T_meas,
+                T_map_ref=T_ref, K_cur=K, K_ref=K)
+    assert res.ok and not res.fallback, res.reason
     assert corner_err(res.W, W_true) < 1.0
-    assert res.correlation > 0.95
+    assert len(trace) == cfg.pyramid_levels and res.params is not None
+    # coarse only (1/4 res): one level solved, a few px at most
+    cfg.pp_finest_level = 2
+    trace = []
+    res = align(cur, valid, ref, valid, H_prior, cfg, trace=trace, T_map_cur=T_meas,
+                T_map_ref=T_ref, K_cur=K, K_ref=K)
+    assert res.ok and len(trace) == 1 and trace[0]['scale'] == 0.25
+    assert corner_err(res.W, W_true) < 3.0
 
 
 def test_change_detects_hot_blob_and_ignores_drift(canvas):
@@ -127,6 +199,44 @@ def test_change_detects_hot_blob_and_ignores_drift(canvas):
     assert b.kind == 'warmer'
     assert abs(b.centroid[0] - 400) < 5 and abs(b.centroid[1] - 300) < 5
     assert np.isnan(ch.diff[:, 0]).all()
+
+
+
+def test_change_detect_colder_switch(canvas):
+    T = pose(rot(0))
+    ref = render_view(canvas, T, noise=3, seed=1)
+    cur = render_view(canvas, T, noise=3, seed=2)
+    cur = add_blob(cur, 400, 300, 150.0)
+    cur = add_blob(cur, 200, 150, -150.0)
+    valid = np.ones((H, W), bool)
+    kinds = sorted(b.kind for b in compute_change(cur, ref, valid, ChangeConfig()).blobs)
+    assert kinds == ['colder', 'warmer']
+    trace = {}
+    ch = compute_change(cur, ref, valid, ChangeConfig(detect_colder=False), trace=trace)
+    assert [b.kind for b in ch.blobs] == ['warmer']
+    assert not trace['colder_open'].any()
+
+
+def test_undistorter_distort_back_roundtrip():
+    from thermal_change_detection.core.camera import Undistorter
+    Kc = np.array([[409.4, 0, 332.4], [0, 412.6, 262.0], [0, 0, 1]])
+    D = np.array([-0.3135, 0.0662, -0.0016, -0.0034])     # strong barrel (eval bag)
+    und = Undistorter(Kc, D, (W, H))
+    rng = np.random.default_rng(0)
+    raw = cv2.GaussianBlur(rng.uniform(0, 1000, (H, W)).astype(np.float32), (0, 0), 3)
+    back = und.distort_back(und.undistort(raw))
+    inner = np.zeros((H, W), bool)
+    inner[60:-60, 80:-80] = True
+    assert np.median(np.abs(back - raw)[inner]) < 2.0
+    # point mapping is the inverse of the remap
+    p = np.array([[50.0, 40.0], [600.0, 480.0], [332.4, 262.0]])
+    mx, my = und.distort_maps()
+    q = und.distort_points(np.c_[[mx[int(y), int(x)] for x, y in p],
+                                 [my[int(y), int(x)] for x, y in p]])
+    assert np.abs(q - np.floor(p)).max() < 0.05
+    x, y, w, h = und.distort_bbox((0, 0, W, H))
+    assert x > 0 and y > 0 and x + w < W and y + h < H   # barrel: full undistorted
+                                                         # frame covers less of the raw
 
 
 def test_store_insert_and_query(tmp_path):
@@ -207,8 +317,136 @@ def test_params_yaml_in_sync_with_config():
     path = os.path.join(os.path.dirname(__file__), '..', 'config', 'params.yaml')
     with open(path) as f:
         params = _flatten_dict(yaml.safe_load(f)['thermal_change_detection']['ros__parameters'])
-    node_only = {'map_frame', 'camera_frame', 'frame_is_optical', 'process_period', 'tf_timeout'}
+    node_only = {'map_frame', 'camera_frame', 'frame_is_optical', 'tf_timeout'}
     defaults = flatten(PipelineConfig())
     assert set(params) - node_only == set(defaults)
     for k, v in defaults.items():
         assert params[k] == v, k
+
+
+# --------------------------------------------------------------------------- stability
+
+def _blob_map(rects, shape=(120, 160)):
+    """rects: list of (kind, x, y, w, h) -> (blobs, labels)."""
+    from thermal_change_detection.core.change import Blob
+    labels = np.zeros(shape, np.int32)
+    blobs = []
+    for kind, x, y, w, h in rects:
+        labels[y:y + h, x:x + w] = len(blobs) + 1
+        blobs.append(Blob(kind, (x, y, w, h), (x + w / 2, y + h / 2), w * h, 0.0, 0.0, 0.0))
+    return blobs, labels
+
+
+def test_stability_measure_keeps_steady_and_drops_changing():
+    from thermal_change_detection.core.config import StabilityConfig
+    from thermal_change_detection.core.stability import measure
+    cfg = StabilityConfig(max_size_change=0.5, match_radius_px=3, min_coverage=0.7)
+    cur, cur_l = _blob_map([('warmer', 10, 10, 20, 20),    # steady
+                            ('warmer', 60, 10, 20, 20),    # shrank to a quarter
+                            ('warmer', 110, 10, 10, 10),   # vanished
+                            ('colder', 10, 60, 20, 20),    # split in two in aux
+                            ('warmer', 60, 60, 20, 20)])   # aux has a COLDER blob there
+    aux, aux_l = _blob_map([('warmer', 11, 11, 20, 19),
+                            ('warmer', 62, 12, 10, 10),
+                            ('colder', 10, 60, 9, 20), ('colder', 21, 60, 9, 20),
+                            ('colder', 60, 60, 20, 20)])
+    valid = np.ones_like(cur_l, bool)
+    measure(cur, cur_l, aux, aux_l, valid, cfg)
+    assert [b.stable for b in cur] == [True, False, False, True, False]
+    assert cur[0].size_change < 0.1 and cur[2].size_change == 1.0
+
+
+def test_stability_not_judged_outside_aux_overlap():
+    from thermal_change_detection.core.config import StabilityConfig
+    from thermal_change_detection.core.stability import drop_unstable, measure
+    from thermal_change_detection.core.change import ChangeResult
+    cfg = StabilityConfig(min_coverage=0.7)
+    cur, cur_l = _blob_map([('warmer', 10, 10, 20, 20), ('warmer', 100, 10, 20, 20)])
+    aux, aux_l = _blob_map([])
+    valid = np.ones_like(cur_l, bool)
+    valid[:, :90] = False                  # first blob outside the aux overlap
+    measure(cur, cur_l, aux, aux_l, valid, cfg)
+    assert cur[0].stable and not cur[1].stable
+    ch = ChangeResult(None, None, valid, None, 1.0, 1.0, 0.0, cur, cur_l)
+    removed = drop_unstable(ch)
+    assert len(removed) == 1 and len(ch.blobs) == 1
+    assert set(np.unique(ch.labels)) == {0, 1} and ch.labels[15, 15] == 1
+
+
+def test_frame_buffer_pick():
+    from thermal_change_detection.core.stability import FrameBuffer
+    fb = FrameBuffer(1.0)
+    for i in range(40):
+        fb.push(i / 30.0, i)
+    s, item = fb.pick(39 / 30.0, 0.2)
+    assert item == 33
+    assert fb.pick(39 / 30.0, 5.0) is None
+
+
+# --------------------------------------------------------------------------- frame selection
+
+def _drive(sel, xs, dt=1 / 30.0, t0=100.0, y=0.0):
+    """Push frames along the x axis (camera looking along z); returns the selections."""
+    out = []
+    for i, x in enumerate(xs):
+        r = sel.push(t0 + i * dt, pose(rot(0), (x, y, 0)), i)
+        if r is not None:
+            out.append(r)
+    return out
+
+
+def _store_with_keyframes(tmp_path, xs):
+    s = KeyframeStore(StoreConfig(storage_dir=str(tmp_path), min_keyframe_age_s=10,
+                                  r_match=1.0))
+    for x in xs:
+        s.insert(np.zeros((4, 4), np.uint16), pose(rot(0), (x, 0, 0)), K, 0.0)
+    return s
+
+
+def test_frame_selector_picks_frame_closest_to_each_keyframe(tmp_path):
+    from thermal_change_detection.core.config import SelectConfig
+    from thermal_change_detection.core.frame_select import FrameSelector
+    kf_x = [0.37, 1.37, 2.37]
+    store = _store_with_keyframes(tmp_path, kf_x)
+    sel = FrameSelector(SelectConfig(mode='closest', rise_margin_m=0.05), store)
+    xs = np.arange(-0.5, 3.5, 0.03)                     # 0.9 m/s at 30 Hz
+    got = _drive(sel, xs, y=0.2)                        # driving 0.2 m beside the old path
+    picked = [(s.kf_id, xs[s.item]) for s in got if s.kf_id is not None]
+    assert [k for k, _ in picked] == [0, 1, 2]
+    for k, x in picked:
+        assert abs(x - kf_x[k]) <= 0.015 + 1e-9         # closest frame (half a frame step)
+    assert all(s.reason == 'passed' for s in got if s.kf_id is not None)
+    assert all(s.reason == 'no_ref' for s in got if s.kf_id is None)   # past the route end
+    store.close()
+
+
+def test_frame_selector_falls_back_to_periodic_without_reference(tmp_path):
+    from thermal_change_detection.core.config import SelectConfig
+    from thermal_change_detection.core.frame_select import FrameSelector
+    store = _store_with_keyframes(tmp_path, [])
+    sel = FrameSelector(SelectConfig(mode='closest', period=1.0), store)
+    got = _drive(sel, np.linspace(0, 3, 91))            # 3 s
+    assert [s.reason for s in got] == ['no_ref'] * 4
+    assert np.allclose(np.diff([s.stamp for s in got]), 1.0, atol=1 / 30.0)
+    store.close()
+
+
+def test_frame_selector_standing_still_uses_max_period(tmp_path):
+    from thermal_change_detection.core.config import SelectConfig
+    from thermal_change_detection.core.frame_select import FrameSelector
+    store = _store_with_keyframes(tmp_path, [0.0])
+    sel = FrameSelector(SelectConfig(mode='closest', max_period=2.0), store)
+    got = _drive(sel, np.zeros(30 * 7))                 # 7 s at the keyframe
+    assert len(got) == 4 and all(s.reason == 'timeout' for s in got)
+    assert np.all(np.abs(np.diff([s.stamp for s in got]) - 2.0) <= 1.5 / 30.0)
+    store.close()
+
+
+def test_frame_selector_periodic_mode(tmp_path):
+    from thermal_change_detection.core.config import SelectConfig
+    from thermal_change_detection.core.frame_select import FrameSelector
+    store = _store_with_keyframes(tmp_path, [0.0])
+    sel = FrameSelector(SelectConfig(mode='periodic', period=0.5), store)
+    got = _drive(sel, np.zeros(60))
+    assert [s.item for s in got] == [0, 15, 30, 45]
+    store.close()

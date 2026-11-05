@@ -12,9 +12,9 @@ def generate_launch_description():
         get_package_share_directory('thermal_change_detection'), 'config', 'params.yaml')
 
     return LaunchDescription([
-        DeclareLaunchArgument('image', default_value='/flir_boson/image_raw',
+        DeclareLaunchArgument('image', default_value='/camera_front_thermo/image_raw',
                               description='Thermal image (run the Boson with video_mode:=RAW16)'),
-        DeclareLaunchArgument('camera_info', default_value='/flir_boson/camera_info'),
+        DeclareLaunchArgument('camera_info', default_value='/camera_front_thermo/camera_info'),
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('use_sim_time', default_value='false'),
 

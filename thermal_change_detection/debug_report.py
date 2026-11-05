@@ -25,7 +25,7 @@ import shutil
 import cv2
 import numpy as np
 
-from .core.align import _centre_shift, masked_correlation, preprocess, warp_to_current
+from .core.align import max_displacement, masked_correlation, preprocess, warp_to_current
 from .core.config import PipelineConfig, load_ros_params_yaml
 from .core.geometry import optical_axis
 from .core.pipeline import ChangeDetectionPipeline
@@ -35,7 +35,7 @@ from .offline_eval import add_bag_args, iter_frames, load_tf
 # every use is accompanied by a text label.
 CATS = {
     'accepted': ('accepted', '#0ca30c'),
-    'rej_shift': ('rejected: correction', '#ec835a'),
+    'fallback': ('accepted, pose prior (refinement discarded)', '#8fd18f'),
     'rej_corr': ('rejected: correlation', '#d03b3b'),
     'rej_overlap': ('rejected: overlap', '#fab219'),
     'noref': ('no reference', '#898781'),
@@ -561,36 +561,51 @@ def frame_report(n, res, cfg, img_dir, rel, cands):
                  ('rotation-only prior error (est.)', par),
              ]) + '<p style="font-size:12px">The pose prior is a pure-rotation homography '
              '<code>K R K⁻¹</code>; the translation is ignored, so a scene at depth Z is '
-             'misplaced by roughly the parallax above. It must be corrected by ECC, and that '
-             f'correction is gated at max_correction_px={cfg.align.max_correction_px:g}.</p>'
+             f'misplaced by roughly the parallax above. It is corrected by align.method='
+             f'<code>{esc(cfg.align.method)}</code>; a correction larger than '
+             f'disp_base_px + f·|t|/disp_min_depth_m = {cfg.align.disp_base_px:g} + '
+             f'{dbg["K"][0, 0]:.0f}·{pc["dist"]:.2f}/{cfg.align.disp_min_depth_m:g} = '
+             f'{res.alignment.bound_px:.0f} px is discarded (pose prior used instead).</p>'
              '</div></div>')
 
     # ---------------------------------------------------------------- alignment
     ar = res.alignment
     W0 = ar.W0
-    cur_p = preprocess(cur, valid, cfg.align.use_gradient)
-    ref_p = preprocess(ref, valid, cfg.align.use_gradient)
+    cur_p = preprocess(cur, valid, cfg.align.features)
+    ref_p = preprocess(ref, valid, cfg.align.features)
     ref_m = (valid > 0).astype(np.uint8)
     stages = [('pose prior (rotation homography)', W0, '')]
+    method = {'ecc': 'ECC', 'plane_parallax': 'plane+parallax'}.get(cfg.align.method,
+                                                                     cfg.align.method)
     for tr in dbg.get('align_trace') or []:
         err = tr['error'].split('error: ')[-1].split(' in function')[0]
-        stages.append((f'after ECC level {tr["level"]} (1/{int(round(1 / tr["scale"]))} res)',
-                       tr['W'], err))
+        extra = ''
+        if 'params' in tr:
+            pp = tr['params']
+            wdeg = np.degrees(pp[:3])
+            extra = (f' · {tr["iterations"]} it · rotation corr. (x,y,z) = '
+                     f'{wdeg[0]:+.2f}°, {wdeg[1]:+.2f}°, {wdeg[2]:+.2f}° · plane m = '
+                     f'({pp[3]:+.3f}, {pp[4]:+.3f}, {pp[5]:+.3f}) 1/m')
+        stages.append((f'after {method} level {tr["level"]} (1/{int(round(1 / tr["scale"]))} res)'
+                       + extra, tr['W'], err))
+    W_ref = stages[-1][1]          # refined warp, before a possible fallback
 
-    S.append('<h2>2. Alignment: pose prior → ECC</h2>')
+    S.append(f'<h2>2. Alignment: pose prior → {esc(method)} on '
+             f'<code>{esc(cfg.align.features)}</code> features</h2>')
     S.append('<p>Each row warps the keyframe into the current frame. <b>Blend</b>: current = '
              'green, keyframe = magenta, gray where they agree; double edges = misalignment. '
              '<b>Hover</b> the warped keyframe to flip to the current image (or enable '
              'auto-blink at the top). <b>|diff|</b>: absolute difference of the normalised '
-             'images ECC works on (white = 3 std). ρ is the masked correlation the gate '
-             'uses, computed at full resolution.</p>')
+             'feature images the refinement and the gate work on (white = 3 std). ρ is the '
+             'masked correlation the gate uses, computed at full resolution. <b>correction</b> '
+             '= largest displacement of any image point vs. the pose prior.</p>')
     for i, (name, W, err) in enumerate(stages):
         ref_w8 = warp_to_current(ref8, W, (w, h))
         m_w = (warp_to_current(ref_m, W, (w, h), cv2.INTER_NEAREST) > 0) & (valid > 0)
         ref_pw = warp_to_current(ref_p, W, (w, h))
         rho = masked_correlation(cur_p, ref_pw, m_w)
         ov = float(m_w.sum()) / max(1, int((valid > 0).sum()))
-        shift = _centre_shift(W, W0, w, h)
+        shift = max_displacement(W, W0, valid)
         diff = np.clip(np.abs(cur_p - ref_pw) * (255 / 3.0), 0, 255).astype(np.uint8)
         a = im(f'st{i}_warp', hatch_invalid(gray_bgr(ref_w8), m_w))
         cap = (f'ρ={rho:.3f} · overlap={ov:.2f} · correction={shift:.0f} px'
@@ -604,29 +619,32 @@ def frame_report(n, res, cfg, img_dir, rel, cands):
                  + '</div>')
 
     pad = 200
-    fp_kf = footprint_canvas(ref8, [(W0, C_PRIOR, 'prior'), (ar.W, C_ECC, 'ECC')], w, h, pad)
-    corner_arrows(fp_kf, W0, ar.W, w, h, pad)
+    fp_kf = footprint_canvas(ref8, [(W0, C_PRIOR, 'prior'), (W_ref, C_ECC, 'refined')],
+                             w, h, pad)
+    corner_arrows(fp_kf, W0, W_ref, w, h, pad)
     fp_cur = footprint_canvas(cur8, [(np.linalg.inv(W0), C_PRIOR, 'prior'),
-                                     (np.linalg.inv(ar.W), C_ECC, 'ECC')], w, h, pad)
+                                     (np.linalg.inv(W_ref), C_ECC, 'refined')], w, h, pad)
     gate = [
         ('overlap', f'{ar.overlap:.3f}', f'≥ {cfg.align.min_overlap:g}',
          ar.overlap >= cfg.align.min_overlap),
         ('correlation ρ', f'{ar.correlation:.3f}', f'≥ {cfg.align.min_correlation:g}',
          ar.correlation >= cfg.align.min_correlation),
-        ('correction', f'{ar.correction_px:.1f} px', f'≤ {cfg.align.max_correction_px:g} px',
-         ar.correction_px <= cfg.align.max_correction_px),
     ]
-    gate_rows = ''.join(
-        f'<tr><td class="l">{k}</td><td>{v}</td><td>{lim}</td>'
-        f'<td class="l {"ok" if ok else "bad"}">{"pass" if ok else "FAIL"}</td></tr>'
-        for k, v, lim, ok in gate)
+    gate_rows = (
+        f'<tr><td class="l">correction vs. prior</td><td>{ar.correction_px:.1f} px</td>'
+        f'<td>≤ {ar.bound_px:.0f} px</td><td class="l {"bad" if ar.fallback else "ok"}">'
+        f'{"exceeded → pose prior used" if ar.fallback else "refinement kept"}</td></tr>'
+        + ''.join(
+            f'<tr><td class="l">{k}</td><td>{v}</td><td>{lim}</td>'
+            f'<td class="l {"ok" if ok else "bad"}">{"pass" if ok else "FAIL"}</td></tr>'
+            for k, v, lim, ok in gate))
     verdict = ('<span class="ok">ACCEPTED</span>' if ar.ok
                else f'<span class="bad">REJECTED: {esc(ar.reason)}</span>')
     S.append('<h3>Footprints and quality gate</h3><div class="grid wide">'
              + fig(im('fp_kf', fp_kf), '<b>current image footprint in the keyframe</b>: '
                    '<span style="color:#ffbe00">yellow = prior</span>, '
-                   '<span style="color:#28c8ff">cyan = ECC</span>; arrows = correction '
-                   'at the corners and the centre (the gate uses the centre)')
+                   '<span style="color:#28c8ff">cyan = refined</span>; arrows = correction '
+                   'at the corners and the centre')
              + fig(im('fp_cur', fp_cur), '<b>keyframe footprint in the current image</b> '
                    '(same colours)')
              + '<div class="card"><table><tr><th class="l">check</th><th>value</th>'
@@ -716,6 +734,7 @@ def frame_report(n, res, cfg, img_dir, rel, cands):
     rows = ''.join(
         f'<tr><td class="l">{b.kind}</td><td>{b.area}</td><td>{b.bbox}</td>'
         f'<td>{b.mean_value:+.1f}</td><td>{b.peak_value:+.1f}</td><td>{b.peak_z:.1f}</td>'
+        f'<td>{f2(b.size_change)}</td>'
         f'<td>{b.persistence}</td><td class="l {"ok" if b.confirmed else ""}">'
         f'{"confirmed" if b.confirmed else "pending"}</td></tr>' for b in res.blobs)
     S.append('<h2>4. Persistence and final overlay</h2><div class="grid wide">'
@@ -726,10 +745,76 @@ def frame_report(n, res, cfg, img_dir, rel, cands):
                f'homography, ±{cfg.persistence.radius_px} px). Only confirmed blobs are '
                'published on <code>~/detections</code>.</p>'
              + ('<div class="scroll"><table><tr><th class="l">kind</th><th>area</th><th>bbox</th>'
-                '<th>mean Δ</th><th>peak Δ</th><th>peak z</th><th>frames</th>'
+                '<th>mean Δ</th><th>peak Δ</th><th>peak z</th><th>size change</th><th>frames</th>'
                 f'<th class="l">state</th></tr>{rows}</table></div>' if rows
                 else '<p>No blobs in this frame.</p>')
              + '</div></div>')
+    if res.stability is not None:
+        S.extend(stability_report(res, cfg, cur8, im))
+    return S
+
+
+def stability_report(res, cfg, cur8, im):
+    """Section 5: blobs of the auxiliary (earlier) frame vs. the current ones."""
+    st, sc = res.stability, cfg.stability
+    S = [f'<h2>5. Stability check (aux frame {sc.lookback_s:g} s earlier)</h2>']
+    if st.alignment is None and st.change is None:
+        S.append(f'<p>Not run: {esc(st.status)}.</p>')
+        return S
+    a = st.alignment
+    S.append(kv_table([
+        ('aux frame', f'{st.dt * 1000:.0f} ms earlier, camera moved {st.baseline_m * 100:.1f} cm'),
+        ('aux alignment to the same keyframe',
+         f'ρ={a.correlation:.2f}, overlap={a.overlap:.2f}'
+         + (' (pose prior, refinement discarded)' if a.fallback else '')
+         + ('' if a.ok else f' <span class="bad">REJECTED: {esc(a.reason)}</span>')),
+        ('rule', f'size change = 1 − min(A_cur, A_aux) / max(A_cur, A_aux) over each group of '
+                 f'overlapping same-polarity blobs (radius {sc.match_radius_px} px); '
+                 f'&gt; {sc.max_size_change:g} → <b>unstable</b>, dropped; groups with '
+                 f'coverage &lt; {sc.min_coverage:g} are not judged (kept)'),
+        ('result', f'{len(st.removed)} of {len(st.cur_blobs)} blobs dropped'),
+    ]))
+    if st.change is None:
+        S.append(f'<p>{esc(st.status)}</p>')
+        return S
+    red, blue = (72, 73, 227), (214, 120, 42)
+    lred, lblue = (150, 150, 235), (235, 180, 120)
+    gray = (150, 150, 150)
+    ach = st.change
+    aux8, _ = norm8(st.aux_image, ach.valid, cfg.viz.gray_low_pct, cfg.viz.gray_high_pct)
+    aux_img = mask_image(aux8, ach.valid, [])
+    for j, b in enumerate(ach.blobs):
+        aux_img[ach.labels == j + 1] = lred if b.kind == 'warmer' else lblue
+    # Current frame: aux blobs (mapped through the keyframe) as light fill,
+    # current blobs as outlines (solid = stable, gray = dropped).
+    cmp_img = mask_image(cur8, st.aux_valid, [])
+    for j, b in enumerate(ach.blobs):
+        cmp_img[st.aux_labels == j + 1] = lred if b.kind == 'warmer' else lblue
+    for i, b in enumerate(st.cur_blobs):
+        sel = (st.cur_labels == i + 1).astype(np.uint8)
+        cnts, _ = cv2.findContours(sel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        col = (red if b.kind == 'warmer' else blue) if b.stable else gray
+        cv2.drawContours(cmp_img, cnts, -1, col, 2)
+        x, y = b.bbox[:2]
+        cv2.putText(cmp_img, f'{f2(b.size_change)}', (x, max(12, y - 3)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    S.append('<div class="grid">'
+             + fig(im('s_aux', aux_img), '<b>aux frame</b> (its own pixels) with its blobs '
+                   'against the same keyframe (light fill)')
+             + fig(im('s_cmp', cmp_img), '<b>current frame</b>: aux blobs mapped through the '
+                   'keyframe (light fill, hatched = outside the aux overlap), current blobs '
+                   'as outlines labelled with their size change; <b>gray outline = dropped</b>')
+             + '</div>')
+    rows = ''.join(
+        f'<tr><td class="l">{", ".join(st.cur_blobs[i].kind for i in g["cur"][:1])}</td>'
+        f'<td>{len(g["cur"])}</td><td>{len(g["aux"])}</td><td>{g["area_cur"]}</td>'
+        f'<td>{g["area_aux"]}</td><td>{g["coverage"]:.2f}</td><td>{g["size_change"]:.2f}</td>'
+        f'<td class="l {"ok" if g["stable"] else "bad"}">'
+        f'{"kept" if g["stable"] and g["judged"] else "kept (not judged)" if g["stable"] else "dropped"}'
+        '</td></tr>' for g in st.groups)
+    S.append('<div class="card scroll"><table><tr><th class="l">kind</th><th>cur blobs</th>'
+             '<th>aux blobs</th><th>A_cur [px]</th><th>A_aux [px]</th><th>coverage</th>'
+             f'<th>size change</th><th class="l">verdict</th></tr>{rows}</table></div>')
     return S
 
 
@@ -740,12 +825,10 @@ def categorize(res):
         return 'noref'
     a = res.alignment
     if a.ok:
-        return 'accepted'
+        return 'fallback' if a.fallback else 'accepted'
     if a.reason.startswith('overlap'):
         return 'rej_overlap'
-    if a.reason.startswith('correlation'):
-        return 'rej_corr'
-    return 'rej_shift'
+    return 'rej_corr'
 
 
 def parse_range(s):
@@ -776,17 +859,25 @@ def write_index(out, args, cfg, recs, kfs):
         f'<a href="frames/f{r["n"]:05d}.html" class="{"kf" if r["inserted"] is not None else ""}"'
         f' style="background:{CATS[r["cat"]][1]}" title="frame {r["n"]}: {esc(r["status"])}">'
         '</a>' for r in recs)
+    tot = lambda k: sum(r[k] or 0 for r in recs)  # noqa: E731
+    tiles += (f'<div class="tile"><b>{tot("n_blobs")}</b><span>blobs (after stability)</span></div>'
+              f'<div class="tile"><b>{tot("n_conf")}</b><span>confirmed blobs</span></div>')
+    if cfg.stability.enabled:
+        tiles += (f'<div class="tile"><b>{tot("n_unstable")}</b><span>blobs dropped as unstable '
+                  f'(lookback {cfg.stability.lookback_s:g} s, max size change '
+                  f'{cfg.stability.max_size_change:g})</span></div>')
     a = cfg.align
     charts = (
         svg_chart(recs, 'd', 'Distance to matched keyframe', 'm',
                   [(cfg.store.r_match, f'r_match {cfg.store.r_match:g}')])
         + svg_chart(recs, 'angle', 'Optical-axis angle to matched keyframe', 'deg',
                     [(cfg.store.theta_match_deg, f'theta_match {cfg.store.theta_match_deg:g}')])
-        + svg_chart(recs, 'rho', 'Correlation ρ after ECC (dot) and with the pose prior '
-                    'only (dash)', 'ρ', [(a.min_correlation, f'min {a.min_correlation:g}')],
-                    extra=('rho_prior',))
-        + svg_chart(recs, 'shift', 'ECC correction vs. pose prior (centre shift, log)',
-                    'px', [(a.max_correction_px, f'max {a.max_correction_px:g}')], log=True)
+        + svg_chart(recs, 'rho', f'Correlation ρ ({a.features} features) of the final warp '
+                    '(dot) and with the pose prior only (dash)', 'ρ',
+                    [(a.min_correlation, f'min {a.min_correlation:g}')], extra=('rho_prior',))
+        + svg_chart(recs, 'shift', 'Refinement correction vs. pose prior (max displacement, '
+                    'log); the per-frame bound is base + f·|t|/Z_min', 'px',
+                    [(a.disp_base_px, f'base {a.disp_base_px:g}')], log=True)
         + svg_chart(recs, 'sigma', 'Noise σ (accepted frames)', 'counts')
         + svg_chart(recs, 'n_blobs', 'Blobs per frame (accepted frames)', 'blobs'))
     rows = []
@@ -801,7 +892,7 @@ def write_index(out, args, cfg, recs, kfs):
             f'<td>{f2(r["rho"])}</td><td>{f2(r["shift"], "{:.0f}")}</td>'
             f'<td>{f2(r["overlap"])}</td><td>{f2(r["ecc_fail"], "{:d}")}</td><td>{f2(r["gain"], "{:.3f}")}</td>'
             f'<td>{f2(r["sigma"], "{:.1f}")}</td><td>{f2(r["n_blobs"], "{:d}")}</td>'
-            f'<td>{f2(r["n_conf"], "{:d}")}</td>'
+            f'<td>{f2(r["n_conf"], "{:d}")}</td><td>{f2(r["n_unstable"], "{:d}")}</td>'
             f'<td>{"" if r["inserted"] is None else "kf%d" % r["inserted"]}</td></tr>')
     body = f"""
 <h1>Thermal change detection: debug report</h1>
@@ -813,17 +904,19 @@ def write_index(out, args, cfg, recs, kfs):
  <i>and</i> theta_match={cfg.store.theta_match_deg:g}° <i>and</i> at least
  min_keyframe_age_s={cfg.store.min_keyframe_age_s:g} s old. Normal on the first lap.</li>
 <li><b>REJECTED</b>: a keyframe was found, the keyframe was aligned to the current image
- (rotation homography from the poses, refined by ECC), but the alignment failed the
- quality gate, so no change map is computed for that frame:
+ (rotation homography from the poses, refined by align.method={esc(a.method)} on
+ {esc(a.features)} features), but the alignment failed the quality gate, so no change map
+ is computed for that frame:
  <ul><li><b>overlap</b> &lt; {a.min_overlap:g}: too little of the image is covered by the warped keyframe;</li>
  <li><b>correlation</b> ρ &lt; {a.min_correlation:g}: the aligned images do not look alike
- (wrong keyframe, ECC diverged, or the scene really changed a lot);</li>
- <li><b>correction</b> &gt; {a.max_correction_px:g} px: ECC moved the image centre further than
- this from where the pose prior put it. Either the prior is poor (translation /
- parallax is ignored by the rotation-only homography, TF timing) or ECC
- converged to a wrong / degenerate homography.</li></ul></li>
-<li><b>accepted</b>: the change map is computed and blobs are reported.</li></ul>
-Every frame page shows the pose change, each ECC pyramid level and the gate values.</div>
+ (wrong keyframe, or the scene really changed a lot, e.g. a person right in front of
+ the camera).</li></ul></li>
+<li><b>accepted</b>: the change map is computed and blobs are reported.</li>
+<li><b>accepted, pose prior</b>: the refinement moved some image point further from the
+ pose prior than physically plausible (disp_base_px={a.disp_base_px:g} px + f·|t| /
+ disp_min_depth_m={a.disp_min_depth_m:g} m), so it was discarded and the frame was
+ compared with the pose prior alone (then gated as usual).</li></ul>
+Every frame page shows the pose change, each refinement pyramid level and the gate values.</div>
 <h2>Timeline</h2><p>{legend()} &nbsp; (dark underline = frame stored as keyframe). Click a
 cell to open the frame.</p><div class="strip">{strip}</div>
 <h2>Top-down map</h2><p>Frames (dots, heading tick = optical axis) coloured by status,
@@ -832,8 +925,8 @@ found a reference.</p><div class="card">{svg_map(recs, kfs)}</div>
 <h2>Metrics per frame</h2><p>{legend()}</p><div class="card">{charts}</div>
 <h2>All frames</h2><div class="card scroll"><table><tr><th>frame</th><th>t [s]</th>
 <th class="l">status</th><th>kf</th><th>d [m]</th><th>angle [°]</th><th>ρ prior</th>
-<th>ρ ECC</th><th>corr. [px]</th><th>overlap</th><th>ECC failed levels</th><th>gain</th><th>σ</th><th>blobs</th>
-<th>confirmed</th><th>new kf</th></tr>{''.join(rows)}</table></div>
+<th>ρ final</th><th>correction [px]</th><th>overlap</th><th>ECC failed levels</th><th>gain</th><th>σ</th><th>blobs</th>
+<th>confirmed</th><th>dropped (unstable)</th><th>new kf</th></tr>{''.join(rows)}</table></div>
 """
     with open(os.path.join(out, 'index.html'), 'w') as f:
         f.write(page('Thermal change debug', body))
@@ -864,27 +957,29 @@ def main():
     tf_buffer = load_tf(args.bag)
     print('pass 2: processing images ...')
     pipeline = ChangeDetectionPipeline(cfg)
-    recs, kfs, pages = [], {}, {}
+    recs, kfs, pages, blob_rows = [], {}, {}, []
     try:
-        for n, (t, img, T, info) in enumerate(iter_frames(args, tf_buffer)):
+        for n, (t, img, T, info, aux, sel) in enumerate(
+                iter_frames(args, tf_buffer, cfg, pipeline.store)):
             K = np.array(info.k).reshape(3, 3)
             cands = nearest_candidates(pipeline.store, T, t)
             res = pipeline.process(img, t, T, K, np.array(info.d), info.distortion_model,
-                                   debug=True)
+                                   debug=True, aux=aux)
+            st = res.stability
             cat = categorize(res)
             m, a, c = res.match, res.alignment, res.change
             rho_prior = None
             if a is not None:
                 dbg = res.debug
                 h, w = dbg['cur'].shape[:2]
-                cp = preprocess(dbg['cur'], dbg['valid'], cfg.align.use_gradient)
-                rp = warp_to_current(preprocess(dbg['ref'], dbg['valid'], cfg.align.use_gradient),
+                cp = preprocess(dbg['cur'], dbg['valid'], cfg.align.features)
+                rp = warp_to_current(preprocess(dbg['ref'], dbg['valid'], cfg.align.features),
                                      a.W0, (w, h))
                 mw = (warp_to_current(dbg['valid'], a.W0, (w, h), cv2.INTER_NEAREST) > 0) \
                     & (dbg['valid'] > 0)
                 rho_prior = masked_correlation(cp, rp, mw)
             rec = dict(
-                n=n, t=t, status=res.status, cat=cat, pos=T[:3, 3].copy(),
+                n=n, t=t, status=f'{res.status} [{sel.reason}]', cat=cat, select=sel.reason, pos=T[:3, 3].copy(),
                 axis=optical_axis(T).copy(), kf=m.keyframe.id if m else None,
                 d=m.distance if m else None, angle=m.angle_deg if m else None,
                 rho=a.correlation if a else None, rho_prior=rho_prior,
@@ -893,9 +988,17 @@ def main():
                 n_blobs=len(c.blobs) if c else None,
                 n_conf=sum(b.confirmed for b in c.blobs) if c else None,
                 inserted=res.inserted.id if res.inserted else None,
+                n_unstable=(len(st.removed) if st else None),
+                baseline=(st.baseline_m if st and st.alignment is not None else None),
                 ecc_fail=(sum(bool(tr['error']) for tr in res.debug.get('align_trace') or [])
                           if a else None))
             recs.append(rec)
+            for b in (st.cur_blobs if st and st.cur_blobs else (c.blobs if c else [])):
+                blob_rows.append([n, f'{t:.3f}', b.kind, b.area, f'{b.peak_z:.1f}',
+                                  '' if b.size_change is None else f'{b.size_change:.3f}',
+                                  int(b.stable), int(b.confirmed),
+                                  '' if rec['baseline'] is None else f'{rec["baseline"]:.3f}',
+                                  st.status if st else ''])
             if res.inserted is not None:
                 kfs[res.inserted.id] = dict(id=res.inserted.id, pos=T[:3, 3].copy(), t=t,
                                             frame=n)
@@ -923,6 +1026,10 @@ def main():
         with open(os.path.join(frames_dir, f'f{n:05d}.html'), 'w') as f:
             f.write(page(f'Frame {n}', nav + head + ''.join(pages[n]), '../style.css'))
     write_index(out, args, cfg, recs, kfs)
+    with open(os.path.join(out, 'blobs.csv'), 'w') as f:
+        f.write('frame,stamp,kind,area,peak_z,size_change,stable,confirmed,baseline_m,stab_status\n')
+        for r in blob_rows:
+            f.write(','.join(str(v) for v in r) + '\n')
     print(f'done: {len(recs)} frames, {len(pages)} detail pages -> '
           f'{os.path.join(os.path.abspath(out), "index.html")}')
 

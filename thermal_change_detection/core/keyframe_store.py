@@ -30,6 +30,7 @@ class Match:
     keyframe: Keyframe
     distance: float
     angle_deg: float
+    score: float          # distance + angle_weight_m_per_deg * angle (lower = better)
 
 
 class KeyframeStore:
@@ -60,9 +61,9 @@ class KeyframeStore:
               & (stamp - self._stamps >= c.min_keyframe_age_s))
         if not ok.any():
             return None
-        score = np.where(ok, d / c.r_match + a / c.theta_match_deg, np.inf)
+        score = np.where(ok, d + c.angle_weight_m_per_deg * a, np.inf)
         i = int(np.argmin(score))
-        return Match(self._kfs[i], float(d[i]), float(a[i]))
+        return Match(self._kfs[i], float(d[i]), float(a[i]), float(score[i]))
 
     def needs_insert(self, T_map_cam) -> bool:
         if not self._kfs:

@@ -1,10 +1,13 @@
 """Thin ROS 2 wrapper around core.ChangeDetectionPipeline.
 
 Subscribes:  image (sensor_msgs/Image, mono16 RAW16 preferred), camera_info
-Uses TF:     map_frame <- camera optical frame at the image stamp
+Uses TF:     map_frame <- camera optical frame at the stamp of every image
+             (cheap, ~0.2 ms); core.frame_select picks the images to process
 Publishes:   ~/overlay (bgr8), ~/diff (32FC1, signed, NaN outside overlap),
              ~/reference_warped (mono8), ~/detections (vision_msgs/Detection2DArray)
 """
+from collections import deque
+
 import numpy as np
 import rclpy
 from cv_bridge import CvBridge
@@ -16,8 +19,10 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithPose
 
 from .core.config import PipelineConfig, flatten, update_from_flat
+from .core.frame_select import FrameSelector
 from .core.geometry import T_BODY_OPTICAL, transform_to_matrix
 from .core.pipeline import ChangeDetectionPipeline
+from .core.stability import FrameBuffer
 
 
 def tf_to_matrix(tf):
@@ -34,7 +39,6 @@ class ThermalChangeDetectionNode(Node):
         # False if camera_frame follows the body convention (x fwd, z up)
         # instead of the optical one (z fwd, y down).
         self.frame_is_optical = self.declare_parameter('frame_is_optical', True).value
-        self.process_period = self.declare_parameter('process_period', 1.0).value
         # Max time [s, image-stamp time] an image may wait for its TF before
         # it is dropped. Waiting is non-blocking (retried on newer images).
         self.tf_timeout = self.declare_parameter('tf_timeout', 0.5).value
@@ -52,8 +56,14 @@ class ThermalChangeDetectionNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.bridge = CvBridge()
         self.camera_info = None
-        self.last_stamp = None
-        self.pending = None   # image due for processing, waiting for its TF
+        self.selector = FrameSelector(cfg.select, self.pipeline.store)
+        self.unposed = deque()   # (stamp, msg) waiting for their TF, in order
+        st, sel = cfg.stability, cfg.select
+        # Recent raw images for the stability check (TF looked up only when
+        # used). The selector may hold a frame for up to max(period, max_period).
+        hold = max(sel.period, sel.max_period) if sel.mode == 'closest' else 0.0
+        self.recent = FrameBuffer(hold + 2.0 * st.lookback_s + self.tf_timeout + 0.5) \
+            if st.enabled else None
 
         sensor_qos = QoSProfile(depth=1, history=HistoryPolicy.KEEP_LAST,
                                 reliability=ReliabilityPolicy.BEST_EFFORT)
@@ -73,38 +83,60 @@ class ThermalChangeDetectionNode(Node):
             self.get_logger().warning('waiting for camera_info', throttle_duration_sec=5.0)
             return
         t = Time.from_msg(msg.header.stamp).nanoseconds * 1e-9
-        if self.pending is None and not (
-                self.last_stamp is not None and 0.0 <= t - self.last_stamp < self.process_period):
-            self.pending = msg
-        if self.pending is not None:
-            self.try_process_pending(t, info)
-
-    def try_process_pending(self, newest_t, info):
-        """Process the pending image if its TF is available (never blocks)."""
-        msg = self.pending
-        stamp = Time.from_msg(msg.header.stamp)
-        t = stamp.nanoseconds * 1e-9
-        frame = self.camera_frame or msg.header.frame_id
-        try:
-            tf = self.tf_buffer.lookup_transform(self.map_frame, frame, stamp)
-        except TransformException as e:
-            if not 0.0 <= newest_t - t <= self.tf_timeout:
-                self.pending = None
+        if self.recent is not None:
+            self.recent.push(t, msg)
+        self.unposed.append((t, msg))
+        # Feed every image whose TF is available to the selector, in order
+        # (never blocks: images still waiting for TF are retried next time).
+        while self.unposed:
+            ft, fmsg = self.unposed[0]
+            try:
+                T = self.lookup_pose(fmsg)
+            except TransformException as e:
+                if 0.0 <= t - ft <= self.tf_timeout:
+                    break
+                self.unposed.popleft()
                 self.get_logger().warning(
-                    f'TF {self.map_frame} <- {frame} not available within '
-                    f'{self.tf_timeout:.2f} s, dropping image: {e}', throttle_duration_sec=5.0)
-            return
-        self.pending = None
-        T = tf_to_matrix(tf)
-        if not self.frame_is_optical:
-            T = T @ T_BODY_OPTICAL
+                    f'TF {self.map_frame} <- {self.camera_frame or fmsg.header.frame_id} not '
+                    f'available within {self.tf_timeout:.2f} s, dropping image: {e}',
+                    throttle_duration_sec=5.0)
+                continue
+            self.unposed.popleft()
+            sel = self.selector.push(ft, T, fmsg)
+            if sel is not None:
+                self.process(sel, info)
 
+    def lookup_pose(self, msg):
+        """T_map_cam (optical) at the image stamp; raises TransformException."""
+        tf = self.tf_buffer.lookup_transform(
+            self.map_frame, self.camera_frame or msg.header.frame_id,
+            Time.from_msg(msg.header.stamp))
+        T = tf_to_matrix(tf)
+        return T if self.frame_is_optical else T @ T_BODY_OPTICAL
+
+    def process(self, sel, info):
+        msg = sel.item
         img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
         K = np.array(info.k).reshape(3, 3)
-        res = self.pipeline.process(img, t, T, K, np.array(info.d), info.distortion_model)
-        self.last_stamp = t
-        self.get_logger().debug(res.status)
+        res = self.pipeline.process(img, sel.stamp, sel.T_map_cam, K, np.array(info.d),
+                                    info.distortion_model, aux=self.aux_frame(sel.stamp))
+        self.get_logger().debug(f'{res.status} [{sel.reason}]')
         self.publish(res, msg.header)
+
+    def aux_frame(self, t):
+        """(image, stamp, T_map_cam) of the buffered frame closest to
+        stability.lookback_s before t, or None."""
+        if self.recent is None:
+            return None
+        picked = self.recent.pick(t, self.pipeline.cfg.stability.lookback_s)
+        if picked is None:
+            return None
+        a_t, msg = picked
+        try:
+            T = self.lookup_pose(msg)
+        except TransformException:
+            return None
+        return self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough'), a_t, T
 
     def publish(self, res, header):
         out = self.bridge.cv2_to_imgmsg(res.overlay, encoding='bgr8')

@@ -2,30 +2,38 @@
 # dataclass in thermal_change_detection/core/config.py (see there for docs).
 thermal_change_detection:
   ros__parameters:
-    map_frame: map
+    map_frame: FP_ENU0
     camera_frame: ""            # empty -> image header frame_id
     frame_is_optical: true      # false if camera_frame is x-forward/z-up
-    process_period: 1.0         # [s] process at most one image per period
     tf_timeout: 0.5             # [s] max wait (image-stamp time) for an image's TF
 
     store:
       r_insert: 0.5             # [m]   store a keyframe if none within r_insert AND theta_insert
-      theta_insert_deg: 5.0
-      r_match: 1.5              # [m]   use a keyframe within r_match AND theta_match ...
-      theta_match_deg: 15.0
+      theta_insert_deg: 8.0
+      r_match: 2.0              # [m]   use a keyframe within r_match AND theta_match ...
+      theta_match_deg: 20.0
       min_keyframe_age_s: 60.0  # [s]   ... that is at least this old
+      angle_weight_m_per_deg: 0.01  # keyframe/frame score = dist [m] + w * angle [deg]
       storage_dir: /tmp/thermal_change_detection
       cleanup_on_exit: true
 
     align:
-      ecc_enabled: true
+      method: plane_parallax               # ecc | plane_parallax | none (pose prior only)
+      features: edges           # edges | gradient | intensity (refinement + gate)
       pyramid_levels: 3
-      max_iterations: 100
+      max_iterations: 100       # ECC
       eps: 1.0e-5
       gauss_filt_size: 5
-      use_gradient: false
-      min_correlation: 0.6      # quality gate
-      max_correction_px: 80.0
+      pp_max_iterations: 30     # plane_parallax
+      pp_step: 2
+      pp_finest_level: 2        # 0 = full res, 1 = 1/2, 2 = 1/4 (faster, less exact)
+      pp_rot_sigma_deg: 1.0
+      pp_plane_depth_m: 20.0
+      pp_inv_depth_sigma: 0.1
+      pp_tilt_sigma: 0.03
+      disp_base_px: 40.0        # refinement may move points <= base + f*|t|/min_depth
+      disp_min_depth_m: 5.0     #   from the pose prior, else the prior is used
+      min_correlation: 0.4      # quality gate (on the features)
       min_overlap: 0.3
 
     change:
@@ -39,6 +47,7 @@ thermal_change_detection:
       z_high: 6.0
       open_kernel: 5
       min_blob_area: 30         # [px]
+      detect_colder: false       # false: only warmer blobs
 
     hotspot:
       abs_threshold: 0.0        # [image units, RAW16 counts]; 0 = disabled, calibrate first!
@@ -50,10 +59,25 @@ thermal_change_detection:
       max_gap_s: 5.0
       radius_px: 25
 
+    stability:                  # short-baseline check against parallax/occlusion blobs
+      enabled: false
+      lookback_s: 0.2           # [s] compare with the frame this much older (same keyframe)
+      max_size_change: 0.5      # drop blobs with 1 - min(A)/max(A) above this (1 = vanished)
+      match_radius_px: 10
+      min_coverage: 0.7
+
+    select:                     # which images are processed (core/frame_select.py)
+      mode: closest             # closest: per keyframe the image closest to it | periodic
+      period: 0.4               # [s] periodic mode / no matching keyframe (first lap)
+      min_period: 0.2           # [s] min spacing of processed images
+      max_period: 3.0           # [s] process the best image so far after this
+      rise_margin_m: 0.05       # score rise past the minimum = keyframe passed
+
     viz:
       gray_low_pct: 1.0
       gray_high_pct: 99.0
       z_min: 3.0
       z_max: 12.0
       alpha_max: 0.75
-      draw_unconfirmed: true
+      draw_unconfirmed: false
+      distort_overlay: true    # true: overlay on the original (distorted) image

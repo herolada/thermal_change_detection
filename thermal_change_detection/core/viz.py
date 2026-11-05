@@ -1,6 +1,8 @@
 """Overlay rendering: grayscale current image + signed diverging heatmap
 (red/yellow = warmer, blue/cyan = colder), alpha proportional to |z|,
 hatched non-overlap region, blob boxes and a status line."""
+from dataclasses import replace
+
 import cv2
 import numpy as np
 
@@ -35,6 +37,9 @@ def _draw_blob(img, b, draw_unconfirmed):
     if not b.confirmed and not draw_unconfirmed:
         return
     x, y, w, h = b.bbox
+    if not b.stable:   # dropped by the stability check: thin gray box
+        cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), (150, 150, 150), 1)
+        return
     color = COLORS.get(b.kind, (255, 255, 255))
     cv2.rectangle(img, (x, y), (x + w - 1, y + h - 1), color, 2 if b.confirmed else 1)
     if b.confirmed:
@@ -45,20 +50,31 @@ def _draw_blob(img, b, draw_unconfirmed):
         cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
 
 
-def render(cur, cur_valid, change, blobs, status, cfg):
-    """cur: float32 current image; change: ChangeResult or None;
-    blobs: all blobs to draw (change + hotspot). Returns (bgr8, (lo, hi))."""
+def render(cur, cur_valid, change, blobs, status, cfg, show_colder=True, und=None, raw=None):
+    """cur: float32 (undistorted) current image; change: ChangeResult or None;
+    blobs: all blobs to draw (change + hotspot). Returns (bgr8, (lo, hi)).
+
+    show_colder=False hides negative changes in the heatmap.
+    und (Undistorter) + raw (original mono image): draw on ``raw`` instead,
+    mapping the change map and the boxes back through the lens model."""
     lo, hi = gray_limits(cur, cur_valid, cfg.gray_low_pct, cfg.gray_high_pct)
-    gray = to_gray8(cur, lo, hi)
+    back = und is not None and raw is not None
+    gray = to_gray8(raw if back else cur, lo, hi)
     out = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR).astype(np.float32)
 
     if change is not None:
         valid = change.valid
         z = np.nan_to_num(change.z, nan=0.0)
+        if not show_colder:
+            z = np.maximum(z, 0.0)
         span = max(cfg.z_max - cfg.z_min, 1e-6)
-        alpha = np.clip((np.abs(z) - cfg.z_min) / span, 0.0, 1.0) * cfg.alpha_max
-        alpha = (alpha * valid)[..., None]
-        out = out * (1.0 - alpha) + _heat_colors(z, cfg.z_max) * alpha
+        alpha = np.clip((np.abs(z) - cfg.z_min) / span, 0.0, 1.0) * cfg.alpha_max * valid
+        heat = _heat_colors(z, cfg.z_max)
+        if back:
+            alpha = und.distort_back(alpha.astype(np.float32))
+            heat = und.distort_back(heat)
+            valid = und.distort_back(valid.astype(np.uint8), cv2.INTER_NEAREST) > 0
+        out = out * (1.0 - alpha[..., None]) + heat * alpha[..., None]
 
         # Non-overlap: darkened with diagonal hatching.
         h, w = valid.shape
@@ -70,6 +86,8 @@ def render(cur, cur_valid, change, blobs, status, cfg):
 
     out = np.clip(out, 0, 255).astype(np.uint8)
     for b in blobs:
+        if back:
+            b = replace(b, bbox=und.distort_bbox(b.bbox))
         _draw_blob(out, b, cfg.draw_unconfirmed)
 
     cv2.rectangle(out, (0, 0), (out.shape[1], 18), (0, 0, 0), -1)
