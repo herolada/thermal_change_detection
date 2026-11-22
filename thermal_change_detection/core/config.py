@@ -144,7 +144,8 @@ class VizConfig:
     # Only the overlay changes; ~/diff, ~/reference_warped and ~/detections
     # stay in undistorted coordinates.
     distort_overlay: bool = False
-    outline_thickness: int = 1          # [px] blob outline
+    outline_thickness: int = 2          # [px] blob outline
+    outline_halo: int = 1               # [px] black border around the outline (0 = off)
     # Status-line "quality" = noise sigma mapped linearly to 100 % (at or below
     # quality_sigma_good) .. 0 % (at or above quality_sigma_bad) [image units].
     quality_sigma_good: float = 8.0

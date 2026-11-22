@@ -46,13 +46,20 @@ def _shown(b, cfg):
     return b.confirmed or cfg.draw_unconfirmed
 
 
-def _draw_outlines(img, masks, colors, thickness):
-    """masks: {kind: bool mask in ``img`` geometry} -> contour lines."""
+def _draw_outlines(img, masks, colors, thickness, halo=0):
+    """masks: {kind: bool mask in ``img`` geometry} -> contour lines. Drawn
+    without anti-aliasing so the line keeps its full colour; ``halo`` > 0 puts
+    a black border of that width [px] under it for contrast on bright images."""
+    contours = {}
     for kind, m in masks.items():
-        if not m.any():
-            continue
-        cnt, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(img, cnt, -1, colors.get(kind, (255, 255, 255)), thickness, cv2.LINE_AA)
+        if m.any():
+            contours[kind], _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_EXTERNAL,
+                                                 cv2.CHAIN_APPROX_SIMPLE)
+    if halo > 0:
+        for cnt in contours.values():
+            cv2.drawContours(img, cnt, -1, (0, 0, 0), thickness + 2 * halo, cv2.LINE_8)
+    for kind, cnt in contours.items():
+        cv2.drawContours(img, cnt, -1, colors.get(kind, (255, 255, 255)), thickness, cv2.LINE_8)
 
 
 def _draw_label(img, b, span, colors):
@@ -130,7 +137,7 @@ def _finish(out, blobs, masks, span, status, cfg, und, colors):
     if und is not None:
         masks = {k: und.distort_back(m.astype(np.uint8), cv2.INTER_NEAREST) > 0
                  for k, m in masks.items()}
-    _draw_outlines(out, masks, colors, cfg.outline_thickness)
+    _draw_outlines(out, masks, colors, cfg.outline_thickness, cfg.outline_halo)
     for b in blobs:
         if not _shown(b, cfg):
             continue

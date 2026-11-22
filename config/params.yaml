@@ -6,9 +6,9 @@ thermal_change_detection:
     camera_frame: ""            # empty -> image header frame_id
     frame_is_optical: true      # false if camera_frame is x-forward/z-up
     tf_timeout: 0.5             # [s] max wait (image-stamp time) for an image's TF
-    heatmap_topic: ""           # non-empty: draw ~/overlay on this false-colour Image
+    heatmap_topic: "/camera_front_thermo/image_heatmap"           # non-empty: draw ~/overlay on this false-colour Image
                                 #   (same aspect ratio as the camera image)
-    heatmap_max_dt: 0.02        # [s] max stamp difference image <-> heatmap (same frame)
+    heatmap_max_dt: 0.05        # [s] max stamp difference image <-> heatmap (same frame)
 
     store:
       r_insert: 0.5             # [m]   store a keyframe if none within r_insert AND theta_insert
@@ -84,6 +84,7 @@ thermal_change_detection:
       alpha_max: 0.75
       draw_unconfirmed: false
       distort_overlay: true    # true: overlay on the original (distorted) image
-      outline_thickness: 1      # [px] blob outline
+      outline_thickness: 2      # [px] blob outline
+      outline_halo: 1           # [px] black border around the outline (0 = off)
       quality_sigma_good: 8.0   # [RAW16 counts] noise sigma shown as quality 100 %
       quality_sigma_bad: 40.0   # [RAW16 counts] noise sigma shown as quality 0 %
